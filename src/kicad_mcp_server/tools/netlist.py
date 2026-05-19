@@ -1,6 +1,7 @@
 """Netlist generation and analysis tools for KiCad MCP Server."""
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 from ..parsers.netlist_parser import NetlistParser
@@ -53,8 +54,8 @@ async def generate_netlist(
             sch_path = root_sch
 
         # KiCad 7+ uses kicad-cli for headless netlist export
-        # Output to /tmp to avoid read-only volume issues
-        netlist_path = Path("/tmp") / (sch_path.stem + ".xml")
+        # Output to temp directory to avoid read-only volume issues
+        netlist_path = Path(tempfile.gettempdir()) / (sch_path.stem + ".xml")
 
         # Try to use KiCad's netlist export
         # Note: This requires KiCad to be installed and in PATH
@@ -75,7 +76,6 @@ async def generate_netlist(
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
                 timeout=30,
             )
 

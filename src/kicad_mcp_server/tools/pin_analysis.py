@@ -8,11 +8,57 @@ This module provides advanced pin analysis capabilities including:
 """
 
 import re
+import tempfile
 from pathlib import Path
 
 from ..parsers.netlist_parser import NetlistParser
 from ..parsers.schematic_parser import SchematicParser
 from ..server import mcp
+
+
+async def _ensure_netlist(sch_path: Path) -> Path | None:
+    """Find or generate a netlist for the given schematic.
+
+    Checks schematic directory first, then temp directory. If neither exists,
+    generates one via kicad-cli (auto-redirects to root schematic for sub-sheets).
+
+    Returns the netlist Path, or None on failure.
+    """
+    # Check for netlist with the given schematic's stem
+    for stem in [sch_path.stem]:
+        local = sch_path.parent / (stem + ".xml")
+        if local.exists():
+            return local
+        temp_nl = Path(tempfile.gettempdir()) / (stem + ".xml")
+        if temp_nl.exists():
+            return temp_nl
+
+    # Also check root schematic stem (sub-sheets redirect to root)
+    pro_files = list(sch_path.parent.glob("*.kicad_pro"))
+    if pro_files:
+        root_stem = pro_files[0].stem
+        local = sch_path.parent / (root_stem + ".xml")
+        if local.exists():
+            return local
+        temp_nl = Path(tempfile.gettempdir()) / (root_stem + ".xml")
+        if temp_nl.exists():
+            return temp_nl
+
+    from .netlist import generate_netlist
+
+    result = await generate_netlist(str(sch_path))
+    if "❌" in result:
+        return None
+
+    # Check all possible locations after generation
+    for stem in [sch_path.stem, pro_files[0].stem if pro_files else ""]:
+        if not stem:
+            continue
+        for base in [sch_path.parent, Path(tempfile.gettempdir())]:
+            candidate = base / (stem + ".xml")
+            if candidate.exists():
+                return candidate
+    return None
 
 # MCU family component patterns
 MCU_PATTERNS = {
@@ -205,15 +251,9 @@ async def analyze_pin_functions(
         schematic_parser = SchematicParser(str(sch_path))
 
         # Generate netlist for accurate connection analysis
-        netlist_path = sch_path.parent / (sch_path.stem + ".xml")
-
-        if not netlist_path.exists():
-            # Try to generate netlist
-            from .netlist import generate_netlist
-
-            netlist_result = await generate_netlist(str(sch_path))
-            if "❌" in netlist_result:
-                return f"❌ **Failed to generate netlist**\n\n{netlist_result}"
+        netlist_path = await _ensure_netlist(sch_path)
+        if netlist_path is None:
+            return "❌ **Failed to generate netlist for pin analysis**"
 
         # Parse netlist
         netlist_parser = NetlistParser(str(netlist_path))
@@ -221,7 +261,7 @@ async def analyze_pin_functions(
         # Get components to analyze
         if reference:
             # Analyze specific component
-            components = [comp for comp in schematic_parser.get_components() if comp["reference"] == reference]
+            components = [comp for comp in schematic_parser.get_components() if comp.reference == reference]
             if not components:
                 return f"❌ **Component not found:** {reference}"
         else:
@@ -232,8 +272,8 @@ async def analyze_pin_functions(
         pin_analysis = []
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
 
             # Check if this is an MCU
             mcu_family = _identify_mcu_family(comp_value)
@@ -417,15 +457,9 @@ async def detect_pin_conflicts(
             return f"❌ **Schematic file not found:** {schematic_path}"
 
         # Generate netlist for accurate connection analysis
-        netlist_path = sch_path.parent / (sch_path.stem + ".xml")
-
-        if not netlist_path.exists():
-            # Try to generate netlist
-            from .netlist import generate_netlist
-
-            netlist_result = await generate_netlist(str(sch_path))
-            if "❌" in netlist_result:
-                return f"❌ **Failed to generate netlist**\n\n{netlist_result}"
+        netlist_path = await _ensure_netlist(sch_path)
+        if netlist_path is None:
+            return "❌ **Failed to generate netlist for conflict detection**"
 
         # Parse netlist
         netlist_parser = NetlistParser(str(netlist_path))
@@ -434,30 +468,26 @@ async def detect_pin_conflicts(
         conflicts = []
 
         # Check for multiple outputs on same net
-        nets = netlist_parser.get_all_nets()
+        all_nets = netlist_parser.get_nets()
 
-        for net in nets:
-            net_name = net.get("name", "")
-            connections = net.get("connections", [])
+        for net_name, net in all_nets.items():
+            connections = net.pins  # list of (ref, pin_number)
 
-            # Count output pins on this net
+            # Count pin connections
             output_pins = []
             input_pins = []
             power_pins = []
 
-            for conn in connections:
-                ref = conn.get("ref", "")
-                pin = conn.get("pin", "")
-
-                # Try to get pin type
-                pin_type = conn.get("type", "unknown")
+            for ref, pin_num in connections:
+                # KiCad netlist doesn't carry pin type; mark as unknown
+                pin_type = "unknown"
 
                 if pin_type == "output":
-                    output_pins.append(f"{ref}:{pin}")
+                    output_pins.append(f"{ref}:{pin_num}")
                 elif pin_type == "input":
-                    input_pins.append(f"{ref}:{pin}")
+                    input_pins.append(f"{ref}:{pin_num}")
                 elif pin_type in ["power_in", "power_out", "power"]:
-                    power_pins.append(f"{ref}:{pin}")
+                    power_pins.append(f"{ref}:{pin_num}")
 
             # Check for multiple outputs
             if len(output_pins) > 1:
@@ -477,28 +507,29 @@ async def detect_pin_conflicts(
                     "description": f"Multiple power pins on same net: {', '.join(power_pins)}",
                 })
 
+        # Check for single-pin nets (potential unconnected)
+        for net_name, net in all_nets.items():
+            if len(net.pins) == 1 and not net_name.startswith("unconnected-"):
+                ref, pin_num = net.pins[0]
+                conflicts.append({
+                    "type": "single_pin_net",
+                    "severity": "warning",
+                    "net": net_name,
+                    "description": f"Net '{net_name}' has only one pin: {ref}:{pin_num}",
+                })
+
         # Check for unconnected input pins
-        components = netlist_parser.get_all_components()
+        all_components = netlist_parser.get_components()
 
-        for component in components:
-            ref = component.get("ref", "")
-            pins = component.get("pins", [])
-
-            for pin in pins:
-                pin_num = pin.get("number", "")
-                pin_type = pin.get("type", "")
-
-                if pin_type == "input":
-                    # Check if pin is connected
-                    connections = netlist_parser.trace_connection(ref, pin_num)
-                    if not connections or not any(c.get("net") for c in connections):
-                        conflicts.append({
-                            "type": "unconnected_input",
-                            "severity": "warning",
-                            "component": ref,
-                            "pin": pin_num,
-                            "description": f"Unconnected input pin: {ref}:{pin_num}",
-                        })
+        for ref, comp in all_components.items():
+            for pin_num, net_name in comp.pins.items():
+                if net_name.startswith("unconnected-"):
+                    conflicts.append({
+                        "type": "unconnected_pin",
+                        "severity": "info",
+                        "net": net_name,
+                        "description": f"{ref} pin {pin_num} is unconnected ({net_name})",
+                    })
 
         if not conflicts:
             return f"""✅ **No Pin Conflicts Detected**
@@ -585,15 +616,9 @@ async def extract_pinmux_config(
         schematic_parser = SchematicParser(str(sch_path))
 
         # Generate netlist for accurate connection analysis
-        netlist_path = sch_path.parent / (sch_path.stem + ".xml")
-
-        if not netlist_path.exists():
-            # Try to generate netlist
-            from .netlist import generate_netlist
-
-            netlist_result = await generate_netlist(str(sch_path))
-            if "❌" in netlist_result:
-                return f"❌ **Failed to generate netlist**\n\n{netlist_result}"
+        netlist_path = await _ensure_netlist(sch_path)
+        if netlist_path is None:
+            return "❌ **Failed to generate netlist for pinmux extraction**"
 
         # Parse netlist
         netlist_parser = NetlistParser(str(netlist_path))
@@ -603,8 +628,8 @@ async def extract_pinmux_config(
         mcu_components = []
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
 
             # Check if this is an MCU
             mcu_family = _identify_mcu_family(comp_value)
@@ -618,7 +643,7 @@ async def extract_pinmux_config(
                     "reference": comp_ref,
                     "value": comp_value,
                     "mcu_family": mcu_family,
-                    "library": component.get("library_id", ""),
+                    "library": component.library_id,
                 })
 
         if not mcu_components:
@@ -646,7 +671,7 @@ No MCU components were found in the schematic.
         pinmux_configs = []
 
         for mcu in mcu_components:
-            mcu_ref = mcu["reference"]
+            mcu_ref = mcu.reference
             mcu_family = mcu["mcu_family"]
 
             config = {
@@ -659,39 +684,20 @@ No MCU components were found in the schematic.
             # Get pin connections from netlist
             try:
                 # Get all pins for this component
-                component_data = None
-                for comp in netlist_parser.get_all_components():
-                    if comp.get("ref") == mcu_ref:
-                        component_data = comp
-                        break
+                comp = netlist_parser.get_components().get(mcu_ref)
 
-                if component_data:
-                    for pin in component_data.get("pins", []):
-                        pin_num = pin.get("number", "")
-                        pin_name = pin.get("name", "")
+                if comp:
+                    for pin_num, net_name in comp.pins.items():
+                        # Infer peripheral function from net name
+                        peripheral = _infer_pin_function_from_net(net_name)
 
-                        # Get net connection
-                        connections = netlist_parser.trace_connection(mcu_ref, pin_num)
+                        pin_config = {
+                            "pin_number": pin_num,
+                            "net": net_name,
+                            "peripheral": peripheral,
+                        }
 
-                        if connections and connections[0].get("net"):
-                            net_name = connections[0]["net"]
-
-                            # Infer peripheral function from net name
-                            peripheral = _infer_pin_function_from_net(net_name)
-
-                            # Get MCU-specific pin mapping
-                            mcu_mapping = _get_mcu_pin_mapping(mcu_family, pin_name)
-
-                            pin_config = {
-                                "pin_number": pin_num,
-                                "pin_name": pin_name,
-                                "net": net_name,
-                                "peripheral": peripheral,
-                                "alternate_functions": mcu_mapping["alternate_functions"] if mcu_mapping else [],
-                                "max_current": mcu_mapping["max_current"] if mcu_mapping else 0,
-                            }
-
-                            config["pins"].append(pin_config)
+                        config["pins"].append(pin_config)
 
             except Exception:
                 # Continue with next MCU if this one fails
