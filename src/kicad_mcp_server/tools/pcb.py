@@ -133,7 +133,7 @@ async def get_pcb_statistics(file_path: str) -> str:
                 f"# PCB Statistics: {file_path}",
                 "",
                 "## Board Information",
-                f"**Dimensions:** {stats['board_width']:.2f} x {stats['board_height']:.2f} mm",
+                f"**Dimensions:** {stats['board_width']:.2f} x {stats['board_width']:.2f} mm",
                 f"**Layers:** {stats['layers']}",
                 f"**Thickness:** {stats['thickness']:.2f} mm",
                 "",
