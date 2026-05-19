@@ -32,7 +32,6 @@ from .tools import (  # noqa: F401, E402
     schematic,
     schematic_editor,
     schematic_search,
-    test_generation,
     validation,
 )
 
