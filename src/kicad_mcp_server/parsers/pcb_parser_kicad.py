@@ -7,6 +7,25 @@ from typing import Any
 
 from ..utils.file_handlers import validate_kicad_file
 
+# pcbnew returns user-facing layer names (TOP, BOTTOM, L2 INNER, etc.)
+# but users typically reference canonical names (F.Cu, B.Cu, In1.Cu, etc.)
+_CANONICAL_LAYER_MAP: dict[str, str] = {
+    "TOP": "F.Cu",
+    "BOTTOM": "B.Cu",
+}
+_INNER_RE = __import__("re").compile(r"^L(\d+)\s+INNER$")
+
+
+def _canonicalize_layer(name: str) -> str:
+    """Convert pcbnew layer name to canonical KiCad name."""
+    if name in _CANONICAL_LAYER_MAP:
+        return _CANONICAL_LAYER_MAP[name]
+    m = _INNER_RE.match(name)
+    if m:
+        # L2 INNER -> In1.Cu (pcbnew L2 = 1st inner = In1.Cu)
+        return f"In{int(m.group(1)) - 1}.Cu"
+    return name
+
 
 @dataclass
 class PCBFootprint:
@@ -89,6 +108,11 @@ class PCBParserKiCad:
         """Convert KiCad position to (x_mm, y_mm)."""
         return (pos.x / 1e6, pos.y / 1e6)
 
+    def _layer_name(self, layer_id_or_name) -> str:
+        """Get canonical layer name (F.Cu, B.Cu, In1.Cu, etc.)."""
+        raw = self.board.GetLayerName(layer_id_or_name)
+        return _canonicalize_layer(raw)
+
     # ── Footprints ──────────────────────────────────────────
 
     def get_footprints(self) -> list[PCBFootprint]:
@@ -114,7 +138,7 @@ class PCBParserKiCad:
                 position=self._pos_mm(pos),
                 rotation=fp.GetOrientation().AsDegrees(),
                 pads_count=fp.GetPadCount(),
-                layer=fp.GetLayerName(),
+                layer=_canonicalize_layer(fp.GetLayerName()),
                 properties=properties,
             ))
         return footprints
@@ -149,7 +173,7 @@ class PCBParserKiCad:
                 start=self._pos_mm(track.GetStart()),
                 end=self._pos_mm(track.GetEnd()),
                 width=self._to_mm(track.GetWidth()),
-                layer=self.board.GetLayerName(track.GetLayer()),
+                layer=self._layer_name(track.GetLayer()),
                 net=track.GetNetname(),
                 length=self._to_mm(track.GetLength()),
             ))
@@ -174,8 +198,8 @@ class PCBParserKiCad:
                 position=self._pos_mm(track.GetStart()),
                 size=size_mm,
                 drill=self._to_mm(track.GetDrill()),
-                top_layer=self.board.GetLayerName(top_layer),
-                bottom_layer=self.board.GetLayerName(track.BottomLayer()),
+                top_layer=self._layer_name(top_layer),
+                bottom_layer=self._layer_name(track.BottomLayer()),
                 net=track.GetNetname(),
             ))
         return vias
@@ -192,7 +216,7 @@ class PCBParserKiCad:
         for zone in self.board.Zones():
             zones.append(PCBZone(
                 net_name=zone.GetNetname(),
-                layer=zone.GetLayerName(),
+                layer=_canonicalize_layer(zone.GetLayerName()),
                 filled=zone.IsFilled(),
             ))
         return zones
