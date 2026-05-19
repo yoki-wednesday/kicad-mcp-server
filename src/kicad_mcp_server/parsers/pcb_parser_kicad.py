@@ -24,6 +24,10 @@ def _canonicalize_layer(name: str) -> str:
     if m:
         # L2 INNER -> In1.Cu (pcbnew L2 = 1st inner = In1.Cu)
         return f"In{int(m.group(1)) - 1}.Cu"
+    # Handle "L2 LNNER" typo from some KiCad versions
+    m2 = __import__("re").match(r"^L(\d+)\s+LNNER$", name)
+    if m2:
+        return f"In{int(m2.group(1)) - 1}.Cu"
     return name
 
 
