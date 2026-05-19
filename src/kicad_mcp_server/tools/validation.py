@@ -1,11 +1,17 @@
 """Design Rule Checking (DRC) and Electrical Rules Check (ERC) tools for KiCad MCP Server."""
 
+import json
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from ..models.types import DRCError, ERCError
 from ..server import mcp
+
+
+def _temp_dir() -> Path:
+    return Path(tempfile.gettempdir())
 
 
 def _find_root_schematic(sch_path: Path) -> Path | None:
@@ -25,43 +31,66 @@ def _find_root_schematic(sch_path: Path) -> Path | None:
 
 
 def _parse_erc_report(report_path: Path) -> list[ERCError]:
-    """Parse ERC report XML file.
+    """Parse ERC report file (JSON or XML format).
 
     Args:
-        report_path: Path to ERC report XML file
+        report_path: Path to ERC report file
 
     Returns:
         List of ERC errors/warnings
     """
     errors = []
+    content = report_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        tree = ET.parse(report_path)
-        root = tree.getroot()
+        data = json.loads(content)
+        # JSON format (KiCad 9.0+)
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                components = []
+                for item in v.get("items", []):
+                    desc = item.get("description", "")
+                    # Extract reference from description like "Symbol U1 pin 1 [...]"
+                    if "Symbol" in desc:
+                        parts = desc.split()
+                        if len(parts) >= 2:
+                            components.append(parts[1])
 
-        # Parse ERC violations
+                errors.append(
+                    ERCError(
+                        severity=v.get("severity", "error"),
+                        type=v.get("type", "unknown"),
+                        description=v.get("description", ""),
+                        components=components,
+                    )
+                )
+        return errors
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    # Fallback: XML format
+    try:
+        root = ET.fromstring(content)
         for violation in root.findall(".//violation"):
             severity = violation.get("severity", "error")
             error_type = violation.get("type", "unknown")
             description = violation.get("description", "")
 
-            # Extract involved components
             components = []
             for comp in violation.findall(".//component"):
                 ref = comp.get("ref", "")
                 if ref:
                     components.append(ref)
 
-            error = ERCError(
-                severity=severity,
-                type=error_type,
-                description=description,
-                components=components,
+            errors.append(
+                ERCError(
+                    severity=severity,
+                    type=error_type,
+                    description=description,
+                    components=components,
+                )
             )
-            errors.append(error)
-
-    except Exception as e:
-        # If XML parsing fails, create a generic error
+    except ET.ParseError as e:
         errors.append(
             ERCError(
                 severity="error",
@@ -75,41 +104,62 @@ def _parse_erc_report(report_path: Path) -> list[ERCError]:
 
 
 def _parse_drc_report(report_path: Path) -> list[DRCError]:
-    """Parse DRC report XML file.
+    """Parse DRC report file (JSON or XML format).
 
     Args:
-        report_path: Path to DRC report XML file
+        report_path: Path to DRC report file
 
     Returns:
         List of DRC errors/warnings
     """
     errors = []
+    content = report_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        tree = ET.parse(report_path)
-        root = tree.getroot()
+        data = json.loads(content)
+        # JSON format (KiCad 9.0+)
+        for sheet in data.get("sheets", []):
+            for v in sheet.get("violations", []):
+                x, y = 0.0, 0.0
+                items = v.get("items", [])
+                if items:
+                    pos = items[0].get("pos", {})
+                    x = float(pos.get("x", 0))
+                    y = float(pos.get("y", 0))
 
-        # Parse DRC violations
+                errors.append(
+                    DRCError(
+                        severity=v.get("severity", "error"),
+                        type=v.get("type", "unknown"),
+                        description=v.get("description", ""),
+                        location=(x, y),
+                    )
+                )
+        return errors
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    # Fallback: XML format
+    try:
+        root = ET.fromstring(content)
         for violation in root.findall(".//violation"):
             severity = violation.get("severity", "error")
             error_type = violation.get("type", "unknown")
             description = violation.get("description", "")
 
-            # Extract location
             location_elem = violation.find(".//location")
             x = float(location_elem.get("x", "0")) if location_elem is not None else 0.0
             y = float(location_elem.get("y", "0")) if location_elem is not None else 0.0
 
-            error = DRCError(
-                severity=severity,
-                type=error_type,
-                description=description,
-                location=(x, y),
+            errors.append(
+                DRCError(
+                    severity=severity,
+                    type=error_type,
+                    description=description,
+                    location=(x, y),
+                )
             )
-            errors.append(error)
-
-    except Exception as e:
-        # If XML parsing fails, create a generic error
+    except ET.ParseError as e:
         errors.append(
             DRCError(
                 severity="error",
@@ -188,7 +238,7 @@ async def run_erc(
             sch_path = root_sch
 
         # ERC report output path
-        erc_report_path = Path("/tmp") / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
 
         # Run ERC using kicad-cli (KiCad 7+)
         cmd = [
@@ -205,9 +255,10 @@ async def run_erc(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
             timeout=60,
         )
+
+        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
 
         if result.returncode != 0:
             return f"""❌ **ERC Check Failed**
@@ -216,7 +267,7 @@ async def run_erc(
 
 **Error:**
 ```
-{result.stderr}
+{stderr_text}
 ```
 
 **Possible causes:**
@@ -355,7 +406,7 @@ async def run_drc(
             return f"❌ **PCB file not found:** {pcb_path}"
 
         # DRC report output path
-        drc_report_path = Path("/tmp") / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
 
         # Run DRC using kicad-cli (KiCad 7+)
         cmd = [
@@ -372,9 +423,10 @@ async def run_drc(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
             timeout=60,
         )
+
+        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
 
         if result.returncode != 0:
             return f"""❌ **DRC Check Failed**
@@ -383,7 +435,7 @@ async def run_drc(
 
 **Error:**
 ```
-{result.stderr}
+{stderr_text}
 ```
 
 **Possible causes:**
@@ -529,7 +581,7 @@ async def get_erc_violations(
             return f"❌ **Schematic file not found:** {schematic_path}"
 
         # ERC report output path
-        erc_report_path = Path("/tmp") / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
 
         if not erc_report_path.exists():
             # Run ERC first
@@ -613,7 +665,7 @@ async def get_drc_violations(
             return f"❌ **PCB file not found:** {pcb_path}"
 
         # DRC report output path
-        drc_report_path = Path("/tmp") / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
 
         if not drc_report_path.exists():
             # Run DRC first
@@ -703,7 +755,7 @@ async def export_erc_report(
             return f"❌ **ERC Check Failed**\n\n{initial_result}"
 
         # ERC report path
-        erc_report_path = Path("/tmp") / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
 
         if not erc_report_path.exists():
             return "❌ **ERC report not found.** Run ERC check first."
@@ -768,7 +820,7 @@ async def export_drc_report(
             return f"❌ **DRC Check Failed**\n\n{initial_result}"
 
         # DRC report path
-        drc_report_path = Path("/tmp") / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
 
         if not drc_report_path.exists():
             return "❌ **DRC report not found.** Run DRC check first."
