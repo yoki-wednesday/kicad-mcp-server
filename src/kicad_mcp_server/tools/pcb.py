@@ -172,15 +172,84 @@ async def analyze_pcb_nets(file_path: str) -> str:
         parser = _get_parser(file_path)
 
         if not _is_pcbnew(parser):
+            data = parser._parse_file()
+            tracks = data["tracks"]
+            vias = data["vias"]
+            zones = data["zones"]
             stats = parser.get_statistics()
-            return (
-                f"# PCB Net Analysis: {file_path}\n\n"
-                f"⚠️ pcbnew not available — limited text-based analysis.\n\n"
-                f"**Copper Zones:** {stats['total_zones']} zones defined\n"
-                f"**Track Segments:** {stats['total_tracks']}\n"
-                f"**Vias:** {stats['total_vias']}\n\n"
-                "Install KiCad and run MCP server with KiCad Python for full routing analysis."
-            )
+
+            lines = [
+                f"# PCB Routing Analysis: {file_path}",
+                "",
+                "⚠️ pcbnew not available — text-based analysis (limited precision)",
+                "",
+                "## Overview",
+                f"**Track Segments:** {len(tracks)}",
+                f"**Vias:** {len(vias)}",
+                f"**Copper Zones:** {len(zones)}",
+            ]
+
+            # Track width distribution
+            width_counts: dict[str, int] = {}
+            for t in tracks:
+                key = f"{t['width']:.3f}mm"
+                width_counts[key] = width_counts.get(key, 0) + 1
+            if width_counts:
+                lines += [
+                    "",
+                    "## Track Width Distribution",
+                    "| Width | Count |",
+                    "|-------|-------|",
+                ]
+                for w, c in sorted(width_counts.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {w} | {c}x |")
+
+            # Via drill distribution
+            drill_counts: dict[str, int] = {}
+            for v in vias:
+                key = f"{v['drill']:.3f}mm"
+                drill_counts[key] = drill_counts.get(key, 0) + 1
+            if drill_counts:
+                lines += [
+                    "",
+                    "## Via Drill Distribution",
+                    f"**Total vias:** {len(vias)}",
+                    "",
+                    "| Drill Size | Count |",
+                    "|------------|-------|",
+                ]
+                for d, c in sorted(drill_counts.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {d} | {c}x |")
+
+            # Per-net track stats
+            net_stats: dict[str, dict] = {}
+            for t in tracks:
+                net = t.get("net", "(unnamed)")
+                if net not in net_stats:
+                    net_stats[net] = {"total_length": 0.0, "segment_count": 0, "widths": [], "layers": set()}
+                s = net_stats[net]
+                s["total_length"] += t.get("length", 0)
+                s["segment_count"] += 1
+                s["widths"].append(t["width"])
+                s["layers"].add(t["layer"])
+
+            top_nets = sorted(net_stats.items(), key=lambda x: -x[1]["total_length"])[:20]
+            if top_nets:
+                lines += [
+                    "",
+                    "## Top 20 Nets by Track Length",
+                    "| Net | Length (mm) | Segments | Widths | Layers |",
+                    "|-----|-------------|----------|--------|--------|",
+                ]
+                for name, s in top_nets:
+                    unique_widths = sorted(set(f"{w:.3f}" for w in s["widths"]))
+                    widths_str = ", ".join(unique_widths)
+                    layers_str = ", ".join(sorted(s["layers"]))
+                    lines.append(
+                        f"| {name} | {s['total_length']:.2f} | {s['segment_count']} | {widths_str} | {layers_str} |"
+                    )
+
+            return "\n".join(lines)
 
         net_stats = parser.get_net_track_stats()
         via_stats = parser.get_via_stats()
@@ -304,13 +373,85 @@ async def find_tracks_by_net(file_path: str, net_name: str) -> str:
         parser = _get_parser(file_path)
 
         if not _is_pcbnew(parser):
+            # Text parser fallback — tracks have net names from KiCad 10 format
             data = parser._parse_file()
-            return (
-                f"# Tracks for net: {net_name}\n\n"
-                "⚠️ pcbnew not available — text parser cannot map tracks to nets.\n"
-                f"Total track segments in design: {len(data['tracks'])}\n\n"
-                "Install KiCad and run MCP server with KiCad Python for per-net track analysis."
-            )
+            matched_tracks = [t for t in data["tracks"] if t.get("net") == net_name]
+            matched_vias = [v for v in data["vias"] if v.get("net") == net_name]
+            matched_zones = [z for z in data["zones"] if z.get("net_name") == net_name]
+
+            if not matched_tracks and not matched_vias:
+                # Try case-insensitive partial match
+                all_nets = sorted(set(
+                    t.get("net", "") for t in data["tracks"] if t.get("net")
+                ))
+                suggestions = [n for n in all_nets if net_name.lower() in n.lower()]
+                if suggestions:
+                    return (
+                        f"# Tracks for '{net_name}'\n\n"
+                        "Exact match not found. Similar nets:\n"
+                        + "\n".join(f"- `{n}` ({sum(1 for t in data['tracks'] if t.get('net') == n)} segments)" for n in suggestions)
+                    )
+                return f"No tracks found for net '{net_name}'."
+
+            total_length = sum(t.get("length", 0) for t in matched_tracks)
+            widths = [t["width"] for t in matched_tracks]
+            layers = sorted(set(t["layer"] for t in matched_tracks))
+
+            lines = [
+                f"# Track Analysis: {net_name}",
+                "",
+                "⚠️ pcbnew not available — text-based analysis (lengths are Euclidean approximations)",
+                "",
+                f"**Track Segments:** {len(matched_tracks)}",
+                f"**Vias:** {len(matched_vias)}",
+                f"**Copper Zones:** {len(matched_zones)}",
+                f"**Total Track Length:** {total_length:.3f} mm (Euclidean approximation)",
+                f"**Layers Used:** {', '.join(layers) if layers else 'N/A'}",
+            ]
+
+            if widths:
+                unique_widths = sorted(set(f"{w:.4f}" for w in widths))
+                lines.append(f"**Track Widths:** {', '.join(unique_widths)} mm")
+
+            if matched_tracks:
+                lines += [
+                    "",
+                    "## Track Segments",
+                    "| # | Start | End | Width | Layer | Length |",
+                    "|---|-------|-----|-------|-------|--------|",
+                ]
+                for i, t in enumerate(matched_tracks[:50], 1):
+                    lines.append(
+                        f"| {i} | ({t['start']['x']:.2f}, {t['start']['y']:.2f}) | "
+                        f"({t['end']['x']:.2f}, {t['end']['y']:.2f}) | {t['width']:.4f} | "
+                        f"{t['layer']} | {t.get('length', 0):.3f} |"
+                    )
+
+            if matched_vias:
+                lines += [
+                    "",
+                    "## Vias",
+                    "| # | Position | Drill | Layers |",
+                    "|---|----------|-------|--------|",
+                ]
+                for i, v in enumerate(matched_vias[:20], 1):
+                    span = v.get("top_layer", "") + " -> " + v.get("bottom_layer", "") if v.get("top_layer") else v.get("layers", "")
+                    lines.append(
+                        f"| {i} | ({v['at']['x']:.2f}, {v['at']['y']:.2f}) | "
+                        f"{v['drill']:.4f} | {span} |"
+                    )
+
+            if matched_zones:
+                lines += [
+                    "",
+                    "## Copper Zones",
+                    "| Net | Layer |",
+                    "|-----|-------|",
+                ]
+                for z in matched_zones:
+                    lines.append(f"| {z['net_name']} | {z.get('layer', 'N/A')} |")
+
+            return "\n".join(lines)
 
         tracks = parser.get_tracks_by_net(net_name)
         vias = parser.get_vias_for_net(net_name)
@@ -321,7 +462,6 @@ async def find_tracks_by_net(file_path: str, net_name: str) -> str:
             all_tracks = parser.get_tracks()
             matching = [t for t in all_tracks if net_name.lower() in t.net.lower()]
             if matching:
-                # Group by exact net name
                 net_names = sorted(set(t.net for t in matching))
                 return (
                     f"# Tracks for '{net_name}'\n\n"
@@ -423,11 +563,72 @@ async def analyze_pcb_signal_integrity(
         parser = _get_parser(file_path)
 
         if not _is_pcbnew(parser):
-            return (
-                "⚠️ pcbnew not available. Signal integrity analysis requires "
-                "KiCad Python (pcbnew module). Install KiCad and run MCP server "
-                "with KiCad Python."
-            )
+            data = parser._parse_file()
+            tracks = data["tracks"]
+            if not tracks:
+                return "No tracks found in PCB file."
+
+            # Build net stats from text parser data
+            net_stats: dict[str, dict] = {}
+            for t in tracks:
+                net = t.get("net", "(unnamed)")
+                if net not in net_stats:
+                    net_stats[net] = {"total_length": 0.0, "segment_count": 0, "widths": [], "layers": set()}
+                s = net_stats[net]
+                s["total_length"] += t.get("length", 0)
+                s["segment_count"] += 1
+                s["widths"].append(t["width"])
+                s["layers"].add(t["layer"])
+
+            lines = [
+                f"# Signal Integrity Analysis: {file_path}",
+                "",
+                "⚠️ pcbnew not available — text-based analysis (limited)",
+            ]
+
+            # Auto-detect differential pairs
+            diff_pairs = _detect_diff_pairs(set(net_stats.keys()))
+            if diff_pairs:
+                lines += [
+                    "",
+                    "## Differential Pair Analysis",
+                    "| Pair | Net P | Net N | Length P | Length N | Delta | Status |",
+                    "|------|-------|-------|----------|----------|--------|---------|",
+                ]
+                for pair_name, net_p, net_n in diff_pairs:
+                    len_p = net_stats[net_p]["total_length"] if net_p in net_stats else 0
+                    len_n = net_stats[net_n]["total_length"] if net_n in net_stats else 0
+                    delta = abs(len_p - len_n)
+                    if delta < 0.127:
+                        status = "OK"
+                    elif delta < 0.5:
+                        status = "⚠️ Marginal"
+                    else:
+                        status = "❌ Mismatch"
+                    lines.append(
+                        f"| {pair_name} | {net_p} | {net_n} | {len_p:.3f} mm | "
+                        f"{len_n:.3f} mm | {delta:.3f} mm | {status} |"
+                    )
+
+            # Longest signal nets
+            power_keywords = ("VDD", "VCC", "GND", "VSS", "3V3", "5V", "1V8", "PGND", "VBUS")
+            signal_nets = [
+                (name, s) for name, s in net_stats.items()
+                if not any(kw in name.upper() for kw in power_keywords)
+            ]
+            top_signals = sorted(signal_nets, key=lambda x: -x[1]["total_length"])[:15]
+            if top_signals:
+                lines += [
+                    "",
+                    "## Longest Signal Nets (Top 15)",
+                    "| Net | Length (mm) | Segments | Layers |",
+                    "|-----|-------------|----------|--------|",
+                ]
+                for name, s in top_signals:
+                    layers = ", ".join(sorted(s["layers"]))
+                    lines.append(f"| {name} | {s['total_length']:.2f} | {s['segment_count']} | {layers} |")
+
+            return "\n".join(lines)
 
         net_stats = parser.get_net_track_stats()
         rules = parser.get_design_rules()
@@ -550,10 +751,72 @@ async def analyze_pcb_power_integrity(file_path: str) -> str:
         parser = _get_parser(file_path)
 
         if not _is_pcbnew(parser):
-            return (
-                "⚠️ pcbnew not available. Power integrity analysis requires "
-                "KiCad Python (pcbnew module)."
-            )
+            data = parser._parse_file()
+            tracks = data["tracks"]
+            zones = data["zones"]
+
+            lines = [
+                f"# Power Integrity Analysis: {file_path}",
+                "",
+                "⚠️ pcbnew not available — text-based analysis (limited)",
+            ]
+
+            # Power zones
+            power_keywords = ("VDD", "VCC", "VBUS", "LDO", "DCDC")
+            gnd_keywords = ("GND", "PGND", "AGND", "DGND")
+
+            power_zones = [z for z in zones if any(kw in z.get("net_name", "").upper() for kw in power_keywords)]
+            gnd_zones = [z for z in zones if any(kw in z.get("net_name", "").upper() for kw in gnd_keywords)]
+
+            if power_zones:
+                lines += [
+                    "",
+                    "## Power Copper Zones",
+                    "| Net | Layer |",
+                    "|-----|-------|",
+                ]
+                for z in power_zones:
+                    lines.append(f"| {z['net_name']} | {z.get('layer', 'N/A')} |")
+
+            if gnd_zones:
+                lines += [
+                    "",
+                    "## GND Copper Zones",
+                    "| Net | Layer |",
+                    "|-----|-------|",
+                ]
+                for z in gnd_zones:
+                    lines.append(f"| {z['net_name']} | {z.get('layer', 'N/A')} |")
+                gnd_layers = set(z.get("layer", "") for z in gnd_zones)
+                lines.append(f"\n**GND Coverage:** {len(gnd_zones)} zones across {len(gnd_layers)} layers")
+
+            # Power net tracks
+            net_stats: dict[str, dict] = {}
+            for t in tracks:
+                net = t.get("net", "")
+                if not net:
+                    continue
+                if net not in net_stats:
+                    net_stats[net] = {"total_length": 0.0, "segment_count": 0, "widths": []}
+                net_stats[net]["total_length"] += t.get("length", 0)
+                net_stats[net]["segment_count"] += 1
+                net_stats[net]["widths"].append(t["width"])
+
+            power_tracks = [(n, s) for n, s in net_stats.items() if any(kw in n.upper() for kw in power_keywords)]
+            if power_tracks:
+                lines += [
+                    "",
+                    "## Power Net Track Routing",
+                    "| Net | Length (mm) | Segments | Min Width | Max Width |",
+                    "|-----|-------------|----------|-----------|-----------|",
+                ]
+                for name, s in sorted(power_tracks, key=lambda x: -x[1]["total_length"]):
+                    lines.append(
+                        f"| {name} | {s['total_length']:.2f} | {s['segment_count']} | "
+                        f"{min(s['widths']):.4f} mm | {max(s['widths']):.4f} mm |"
+                    )
+
+            return "\n".join(lines)
 
         net_stats = parser.get_net_track_stats()
         zones = parser.get_zones()
