@@ -449,13 +449,22 @@ class SchematicParser:
         """Parse hierarchical sheets."""
         sheets = []
 
-        # Find sheet instances
-        sheet_pattern = r'\(sheet\s+\(at\s+(\d+)\s+(\d+)\)\s*\(size\s+\d+\s+\d+\)\s*\(fields_autoplaced\s+yes\)\s*\(stroke[^)]*\)\s*\(fill[^)]*\)\s*\(property\s+"Sheetname"\s+"([^"]+)"[^)]*\(property\s+"Sheetfile"\s+"([^"]+)"'
+        # Match sheet blocks and extract Sheetname/Sheetfile properties
+        # KiCad 10+ adds extra attributes between (size ...) and (property ...),
+        # so we use a flexible pattern with [\s\S]*? to skip them.
+        sheet_pattern = (
+            r'\(sheet\s+\(at\s+[\d.]+\s+[\d.]+\)\s*'
+            r'\(size\s+[\d.]+\s+[\d.]+\)'
+            r'[\s\S]*?'
+            r'\(property\s+"Sheetname"\s+"([^"]+)"'
+            r'[\s\S]*?'
+            r'\(property\s+"Sheetfile"\s+"([^"]+)"'
+        )
 
         for match in re.finditer(sheet_pattern, content):
             sheets.append({
-                "name": match.group(3),
-                "file": match.group(4),
+                "name": match.group(1),
+                "file": match.group(2),
             })
 
         return sheets
