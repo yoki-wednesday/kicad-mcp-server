@@ -211,15 +211,28 @@ class PCBParser:
         """Parse track segments."""
         tracks = []
 
-        # Pattern: (segment (start ...) (end ...) (width ...) (layer ...))
-        segment_pattern = r'\(segment\s+\(start\s+([\d.]+)\s+([\d.]+)\)\s+\(end\s+([\d.]+)\s+([\d.]+)\)\s+\(width\s+([\d.]+)\)\s+\(layer\s+"([^"]+)"'
+        # KiCad 10 format: (segment (start x y) (end x y) (width w) (layer "...") (net "name") (uuid "..."))
+        # The net field uses quoted string: (net "netname")
+        segment_pattern = (
+            r'\(segment\s+'
+            r'\(start\s+([\d.]+)\s+([\d.]+)\)\s+'
+            r'\(end\s+([\d.]+)\s+([\d.]+)\)\s+'
+            r'\(width\s+([\d.]+)\)\s+'
+            r'\(layer\s+"([^"]+)"\)\s+'
+            r'\(net\s+"([^"]*)"\)'
+        )
 
         for match in re.finditer(segment_pattern, content):
+            x1, y1 = float(match.group(1)), float(match.group(2))
+            x2, y2 = float(match.group(3)), float(match.group(4))
+            dx, dy = x2 - x1, y2 - y1
             tracks.append({
-                "start": {"x": float(match.group(1)), "y": float(match.group(2))},
-                "end": {"x": float(match.group(3)), "y": float(match.group(4))},
+                "start": {"x": x1, "y": y1},
+                "end": {"x": x2, "y": y2},
                 "width": float(match.group(5)),
                 "layer": match.group(6),
+                "net": match.group(7),
+                "length": (dx * dx + dy * dy) ** 0.5,
             })
 
         return tracks
@@ -228,15 +241,36 @@ class PCBParser:
         """Parse vias."""
         vias = []
 
-        # Pattern: (via (at ...) (size ...) (drill ...) (layers ...) ...)
-        via_pattern = r'\(via\s+\(at\s+([\d.]+)\s+([\d.]+)\)\s+\(size\s+([\d.]+)\)\s+\(drill\s+([\d.]+)'
+        # KiCad 10 format: (via (at x y) (size s) (drill d) (layers "L1" "L2") (free yes) (net "name") (uuid "..."))
+        via_pattern = (
+            r'\(via\s+'
+            r'\(at\s+([\d.]+)\s+([\d.]+)\)\s+'
+            r'\(size\s+([\d.]+)\)\s+'
+            r'\(drill\s+([\d.]+)\)\s+'
+            r'\(layers\s+"([^"]+)"\s+"([^"]+)"\)\s+'
+            r'(?:\(free\s+yes\)\s+)?'
+            r'(?:\(net\s+"([^"]*)"\)\s+)?'
+        )
 
         for match in re.finditer(via_pattern, content):
             vias.append({
                 "at": {"x": float(match.group(1)), "y": float(match.group(2))},
                 "size": float(match.group(3)),
                 "drill": float(match.group(4)),
+                "top_layer": match.group(5),
+                "bottom_layer": match.group(6),
+                "net": match.group(7) or "",
             })
+
+        # Fallback: simpler pattern for single-layer via or older format
+        if not vias:
+            via_pattern_simple = r'\(via\s+\(at\s+([\d.]+)\s+([\d.]+)\)\s+\(size\s+([\d.]+)\)\s+\(drill\s+([\d.]+)'
+            for match in re.finditer(via_pattern_simple, content):
+                vias.append({
+                    "at": {"x": float(match.group(1)), "y": float(match.group(2))},
+                    "size": float(match.group(3)),
+                    "drill": float(match.group(4)),
+                })
 
         return vias
 
@@ -244,14 +278,23 @@ class PCBParser:
         """Parse copper zones."""
         zones = []
 
-        # Pattern: (zone (net ...) (net_name ...) ...)
-        zone_pattern = r'\(zone\s+\(net\s+(\d+)\)\s*\(net_name\s+"([^"]+)"'
+        # KiCad 10 format: (zone (net "name") (layer "...") ...)
+        zone_pattern = r'\(zone\s+\(net\s+"([^"]+)"\)\s+\(layer\s+"([^"]+)"\)'
 
         for match in re.finditer(zone_pattern, content):
             zones.append({
-                "net": int(match.group(1)),
-                "net_name": match.group(2),
+                "net_name": match.group(1),
+                "layer": match.group(2),
             })
+
+        # Fallback: KiCad 9 format (net code + net_name)
+        if not zones:
+            zone_pattern_v9 = r'\(zone\s+\(net\s+(\d+)\)\s*\(net_name\s+"([^"]+)"'
+            for match in re.finditer(zone_pattern_v9, content):
+                zones.append({
+                    "net_name": match.group(2),
+                    "layer": "",
+                })
 
         return zones
 
