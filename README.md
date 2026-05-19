@@ -5,7 +5,7 @@ A Model Context Protocol (MCP) server for KiCad 9.0+ that lets AI assistants ana
 ## Features
 
 - **Schematic Analysis** - Components, nets, symbols, hierarchical sheets
-- **PCB Analysis** - Footprints, tracks, statistics via pcbnew API
+- **PCB Analysis** - Footprints, tracks, routing quality, signal/power integrity via pcbnew API
 - **Netlist Tracing** - 100% accurate pin-level connection tracking
 - **Design Validation** - ERC/DRC via kicad-cli (headless, CI friendly)
 - **Pin Analysis** - Pin function detection, conflict analysis, pinmux config
@@ -14,16 +14,42 @@ A Model Context Protocol (MCP) server for KiCad 9.0+ that lets AI assistants ana
 
 ## Requirements
 
-- Python 3.10+
 - KiCad 8.0+ (9.0 or 10.0 recommended)
 - `kicad-cli` in PATH (included with KiCad)
 
 ## Installation
 
+### Recommended: Install into KiCad Python (Full PCB Analysis)
+
+KiCad ships with its own Python that includes the `pcbnew` module. Installing into this Python gives you full PCB analysis capabilities (precise track lengths, via statistics, signal integrity, power integrity).
+
+**Step 1**: Find your KiCad Python path:
+
+| Platform | Path |
+|----------|------|
+| Windows | `C:\Program Files\KiCad\<version>\bin\python.exe` |
+| macOS | `/Applications/KiCad/KiCad.app/Contents/Frameworks/python3` |
+| Linux | `/usr/bin/python3` (if kicad python bindings installed) |
+
+**Step 2**: Install the package into KiCad Python:
+
 ```bash
-# Clone and install
-git clone https://github.com/Seeed-Studio/kicad-mcp-server.git
-cd kicad-mcp-server
+# Windows example (KiCad 10.0)
+"C:\Program Files\KiCad\10.0\bin\python.exe" -m pip install fastmcp
+"C:\Program Files\KiCad\10.0\bin\python.exe" -m pip install -e .
+
+# macOS example
+/Applications/KiCad/KiCad.app/Contents/Frameworks/python3 -m pip install fastmcp
+/Applications/KiCad/KiCad.app/Contents/Frameworks/python3 -m pip install -e .
+```
+
+**Step 3**: Configure MCP to use KiCad Python (see Configuration section below).
+
+### Fallback: Install into System Python (Limited PCB Analysis)
+
+If you skip KiCad Python setup, the server still works but falls back to text-based PCB parsing. You get basic data (track counts, net names, widths) but lose precise lengths, design rules, and signal integrity analysis.
+
+```bash
 pip install -e .
 ```
 
@@ -35,6 +61,23 @@ Edit your config file:
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+**With KiCad Python (recommended):**
+
+```json
+{
+  "mcpServers": {
+    "kicad": {
+      "type": "stdio",
+      "command": "C:\\Program Files\\KiCad\\10.0\\bin\\python.exe",
+      "args": ["-m", "kicad_mcp_server"],
+      "cwd": "C:\\Users\\YourName\\Desktop\\kicad-mcp-server"
+    }
+  }
+}
+```
+
+**With system Python (fallback):**
 
 ```json
 {
@@ -49,13 +92,19 @@ Edit your config file:
 }
 ```
 
+### Claude Code CLI
+
+```bash
+# With KiCad Python (recommended)
+claude mcp add kicad -s user -- "C:\Program Files\KiCad\10.0\bin\python.exe" -m kicad_mcp_server
+
+# With system Python (fallback)
+claude mcp add kicad -s user -- python -m kicad_mcp_server
+```
+
 ### Cursor / Windsurf / Other MCP Clients
 
-Use the same config structure with your client's MCP settings. The server command is:
-
-```
-python -m kicad_mcp_server
-```
+Use the same config structure with your client's MCP settings. Point `command` to KiCad Python for full analysis, or `python` for fallback mode.
 
 ### Verify Installation
 
@@ -63,7 +112,13 @@ After restarting your AI client, ask it:
 
 > "What tools are available for KiCad?"
 
-You should see a list of KiCad MCP tools. If not, check that:
+You should see a list of KiCad MCP tools. To verify pcbnew is working:
+
+> "Get PCB statistics for MyBoard.kicad_pcb"
+
+If the response shows **Design Rules** section with clearance/width values, pcbnew is active. If it shows **board dimensions as approximation**, you're in text-only mode.
+
+Common issues:
 1. KiCad is installed and `kicad-cli` is accessible
 2. The `cwd` path in your config points to the correct directory
 3. Python can import the package (`python -c "import kicad_mcp_server"`)
@@ -114,7 +169,13 @@ Uses `run_erc`, `run_drc`, and `detect_pin_conflicts`.
 
 > "List all footprints on the top layer"
 
-> "Find all tracks on the GND net"
+> "Find all tracks on the VDD_nRF net"
+
+> "Analyze PCB routing quality"
+
+> "Check signal integrity - are USB differential pairs length-matched?"
+
+> "Analyze power integrity - how's the GND coverage?"
 
 ### 5. Create a New Project
 
@@ -153,8 +214,11 @@ Uses `run_erc`, `run_drc`, and `detect_pin_conflicts`.
 | Tool | Description |
 |------|-------------|
 | `list_pcb_footprints` | List footprints with optional layer filter |
-| `get_pcb_statistics` | Board dimensions, layer count, pad/track counts |
-| `find_tracks_by_net` | Find all tracks belonging to a net |
+| `get_pcb_statistics` | Board dimensions, layer count, design rules |
+| `find_tracks_by_net` | Track segments, lengths, widths, vias for a specific net |
+| `analyze_pcb_nets` | Routing analysis: width/via distribution, net length ranking |
+| `analyze_pcb_signal_integrity` | Diff pair matching, RF traces, longest signal nets |
+| `analyze_pcb_power_integrity` | Power zones, GND coverage, power routing analysis |
 
 ### Netlist Analysis
 
@@ -215,9 +279,13 @@ set PATH=%PATH%;C:\Program Files\KiCad\10.0\bin
 export PATH="/usr/bin:$PATH"
 ```
 
-### "pcbnew module not found"
+### "pcbnew module not found" / PCB analysis is limited
 
-The pcbnew Python module is bundled with KiCad's own Python. For PCB analysis, the server falls back to text-based parsing when pcbnew is unavailable. Full PCB analysis requires running with KiCad's Python environment.
+pcbnew is only available in KiCad's bundled Python. Two options:
+
+**Option A (recommended)**: Configure MCP to use KiCad Python — see [Installation](#recommended-install-into-kicad-python-full-pcb-analysis).
+
+**Option B**: Accept text-only mode. You'll still get basic PCB data (footprints, track counts, net names) but without precise lengths or design rules.
 
 ### Python 3.14 install fails
 
