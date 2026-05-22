@@ -416,8 +416,8 @@ Please specify a supported SOC family."""
         components = list(schematic_parser.get_components())
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
             # Find device tree binding
             for category, _bindings in DEVICE_TREE_BINDINGS.items():
                 binding = _find_component_binding(comp_value, category)
@@ -489,8 +489,8 @@ Please specify a supported SOC family."""
 
         # Extract GPIO pins
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
 
             # Check if this is an MCU
             if any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF"]):
@@ -769,8 +769,8 @@ async def extract_i2c_devices(
         components = list(schematic_parser.get_components())
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
             # Check if this is an I2C device
             for category, _bindings in DEVICE_TREE_BINDINGS.items():
                 binding = _find_component_binding(comp_value, category)
@@ -893,8 +893,8 @@ async def extract_spi_devices(
         components = list(schematic_parser.get_components())
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
+            comp_ref = component.reference
+            comp_value = component.value
 
             # Check if this is an SPI device
             for category, _bindings in DEVICE_TREE_BINDINGS.items():
@@ -1003,9 +1003,9 @@ async def extract_power_domains(
         components = list(schematic_parser.get_components())
 
         for component in components:
-            comp_ref = component["reference"]
-            comp_value = component.get("value", "")
-            comp_library = component.get("library_id", "")
+            comp_ref = component.reference
+            comp_value = component.value
+            comp_library = component.library_id
 
             # Check if this is a power-related component
             power_keywords = ["REG", "LDO", "BUCK", "BOOST", "TPS", "AP", "LP", "AXP"]
@@ -1131,7 +1131,7 @@ resolve all conflicts before attempting device tree generation."""
 
         mcu_found = False
         for component in components:
-            comp_value = component.get("value", "")
+            comp_value = component.value
             if any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF", "ATMEGA"]):
                 mcu_found = True
                 break
