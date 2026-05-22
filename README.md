@@ -308,6 +308,7 @@ Thanks to all contributors and community feedback:
 - [@raffaeler](https://github.com/raffaeler) for KiCad 10 compatibility testing and feedback (#9)
 - [@shivam5594](https://github.com/shivam5594) for Python 3.14 install issue report (#11)
 - [@derekc00](https://github.com/derekc00) for lint fixes (#10)
+- [@befedo](https://github.com/befedo) for SchematicComponent dataclass access bug report and patch (#13)
 
 ## License
 
