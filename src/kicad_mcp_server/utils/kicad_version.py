@@ -91,4 +91,4 @@ def get_pcb_version() -> str:
                         return m.group(1)
                 except OSError:
                     pass
-    return "20240130"
+    return "20260206"
