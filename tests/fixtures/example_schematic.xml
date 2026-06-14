@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export version="D">
+  <components>
+    <comp ref="U1">
+      <value>ESP32-WROOM-32</value>
+      <libsource libpart="ESP32_WROOM"/>
+      <footprint>Module:ESP32-WROOM-32</footprint>
+    </comp>
+    <comp ref="R1">
+      <value>10k</value>
+      <libsource libpart="R"/>
+    </comp>
+    <comp ref="R2">
+      <value>BMP280</value>
+      <libsource libpart="BMP280"/>
+    </comp>
+  </components>
+  <nets>
+    <net code="1" name="GPIO_1">
+      <node ref="U1" pin="1"/>
+    </net>
+    <net code="2" name="I2C_SDA_0x76">
+      <node ref="U1" pin="2"/>
+      <node ref="R2" pin="1"/>
+    </net>
+  </nets>
+</export>

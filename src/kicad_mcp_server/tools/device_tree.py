@@ -7,7 +7,9 @@ This module provides device tree source (.dts) generation capabilities including
 - SOC-specific device tree generation
 """
 
+import asyncio
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Template
 
@@ -301,6 +303,11 @@ def _find_component_binding(component_value: str, component_type: str) -> dict |
     return None
 
 
+# DTS Config Generation Header/Footer constants
+DTS_CONFIG_HEADER = "\n## Device Tree Configuration\n\n```dts\n"
+DTS_CONFIG_FOOTER = "};\n```"
+
+
 def _infer_peripheral_type(net_name: str) -> str | None:
     """Infer peripheral type from net name.
 
@@ -351,6 +358,268 @@ def _extract_i2c_address_from_net(net_name: str) -> int | None:
             return address
 
     return None
+
+
+def _get_pin_connections(netlist_parser: NetlistParser, comp_ref: str) -> list[dict]:
+    """Get net connections for the first 8 pins of a component."""
+    connections = []
+    for pin_num in range(1, 9):
+        try:
+            pin_connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
+            if pin_connections and "net" in pin_connections:
+                net_name = pin_connections["net"]
+                peripheral_type = _infer_peripheral_type(net_name)
+                connections.append({
+                    "net": net_name,
+                    "peripheral": peripheral_type,
+                    "pin": pin_num,
+                })
+        except Exception:
+            continue
+    return connections
+
+
+def _process_component_peripheral(component: Any, netlist_parser: NetlistParser, dt_data: dict) -> None:
+    """Analyze a single component and add peripheral info to dt_data."""
+    comp_ref = component.reference
+    comp_value = component.value
+
+    for category in DEVICE_TREE_BINDINGS:
+        binding = _find_component_binding(comp_value, category)
+        if not binding:
+            continue
+
+        connections = _get_pin_connections(netlist_parser, comp_ref)
+        if not connections:
+            continue
+
+        # Determine peripheral type based on connections
+        i2c_nets = [c for c in connections if c["peripheral"] == "I2C"]
+        spi_nets = [c for c in connections if c["peripheral"] == "SPI"]
+        uart_nets = [c for c in connections if c["peripheral"] == "UART"]
+
+        if i2c_nets:
+            i2c_address = _extract_i2c_address_from_net(i2c_nets[0]["net"])
+            device = {
+                "name": comp_ref,
+                "compatible": binding["compatible"],
+                "address": i2c_address or 0x00,
+                "properties": {},
+            }
+            dt_data["i2c_buses"].append({
+                "number": 1,
+                "address": "0x40005400",
+                "devices": [device],
+            })
+        elif spi_nets:
+            device = {
+                "name": comp_ref,
+                "compatible": binding["compatible"],
+                "cs": 0,
+                "frequency": 1000000,
+                "properties": {},
+            }
+            dt_data["spi_buses"].append({
+                "number": 1,
+                "address": "0x40013000",
+                "devices": [device],
+            })
+        elif uart_nets:
+            dt_data["uarts"].append({
+                "number": 1,
+                "address": "0x40011000",
+            })
+        break
+
+
+def _is_matching_soc(comp_value: str) -> bool:
+    """Check if component value contains a supported SOC name."""
+    return any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF"])
+
+
+def _extract_pin_gpios(comp_ref: str, netlist_parser: NetlistParser, dt_data: dict) -> None:
+    """Trace and extract GPIO configurations for each pin of a component."""
+    for pin_num in range(1, 100):
+        try:
+            pin_connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
+            if pin_connections and "net" in pin_connections:
+                net_name = pin_connections["net"]
+                if "GPIO" in net_name.upper() or "IO" in net_name.upper():
+                    dt_data["gpio_pins"].append({
+                        "number": pin_num,
+                        "name": f"P{pin_num}",
+                    })
+        except Exception:
+            continue
+
+
+def _extract_mcu_gpios(components: list[Any], netlist_parser: NetlistParser, dt_data: dict) -> None:
+    """Extract GPIO pins for MCU components and append to dt_data."""
+    for component in components:
+        if _is_matching_soc(component.value):
+            _extract_pin_gpios(component.reference, netlist_parser, dt_data)
+
+
+def _is_mcu(comp_value: str) -> bool:
+    """Check if component value corresponds to a supported MCU family."""
+    return any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF", "ATMEGA"])
+
+
+def _should_process_mcu(comp_value: str, soc_family: str) -> bool:
+    """Check if component is MCU and matches the specified SOC family filter."""
+    if soc_family and soc_family.lower() not in comp_value.lower():
+        return False
+    return _is_mcu(comp_value)
+
+
+def _find_component_gpio_configs(
+    comp_ref: str, comp_value: str, pins: list[Any], netlist_parser: NetlistParser
+) -> list[dict]:
+    """Find GPIO configurations for a single component's pins."""
+    configs = []
+    for pin_num in pins:
+        try:
+            connections = netlist_parser.trace_connection(comp_ref, pin_num)
+            if connections and "net" in connections:
+                net_name = connections["net"]
+                if "GPIO" in net_name.upper() or "IO" in net_name.upper():
+                    configs.append({
+                        "component": comp_ref,
+                        "pin_number": pin_num,
+                        "pin_name": f"Pin {pin_num}",
+                        "net": net_name,
+                        "soc": comp_value,
+                    })
+        except Exception:
+            continue
+    return configs
+
+
+def _find_gpio_configs(netlist_parser: NetlistParser, soc_family: str) -> list[dict]:
+    """Find and return GPIO configurations from MCU components."""
+    gpio_configs = []
+    components = netlist_parser.get_components()
+
+    for comp_ref, component in components.items():
+        if _should_process_mcu(component.value, soc_family):
+            configs = _find_component_gpio_configs(
+                comp_ref, component.value, component.pins, netlist_parser
+            )
+            gpio_configs.extend(configs)
+    return gpio_configs
+
+
+def _generate_gpio_c_code(configs: list[dict], soc: str) -> str:
+    """Generate C initialization code snippet for a list of GPIO configs."""
+    result = f"// GPIO configuration for {soc}\n\n"
+    for config in configs[:10]:
+        result += f"// {config['pin_name']} ({config['pin_number']}): {config['net']}\n"
+        if "STM32" in soc.upper():
+            result += f"GPIO_InitTypeDef gpio_{config['pin_name'].lower()};\n"
+            result += f"gpio_{config['pin_name'].lower()}.Pin = GPIO_PIN_{config['pin_number']};\n"
+            result += f"gpio_{config['pin_name'].lower()}.Mode = GPIO_MODE_OUTPUT_PP;\n"
+            result += f"HAL_GPIO_Init(GPIO{config['pin_name'][1]}, &gpio_{config['pin_name'].lower()});\n\n"
+        elif "ESP32" in soc.upper():
+            result += f"gpio_set_direction(GPIO{config['pin_number']}, GPIO_MODE_OUTPUT);\n\n"
+    if len(configs) > 10:
+        result += f"// ... and {len(configs) - 10} more GPIO pins\n"
+    return result
+
+
+def _find_i2c_binding(comp_value: str) -> dict | None:
+    """Find device tree binding for I2C compatible components."""
+    for category in DEVICE_TREE_BINDINGS:
+        binding = _find_component_binding(comp_value, category)
+        if binding:
+            return binding
+    return None
+
+
+def _check_i2c_pins(
+    comp_ref: str, comp_value: str, binding: dict, netlist_parser: NetlistParser
+) -> dict | None:
+    """Trace component pins to identify I2C/TWI connections."""
+    for pin_num in range(1, 9):
+        try:
+            connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
+            if connections and "net" in connections:
+                net_name = connections["net"]
+                if "I2C" in net_name.upper() or "TWI" in net_name.upper():
+                    i2c_address = _extract_i2c_address_from_net(net_name)
+                    return {
+                        "component": comp_ref,
+                        "value": comp_value,
+                        "compatible": binding["compatible"],
+                        "address": i2c_address,
+                        "net": net_name,
+                        "pin": pin_num,
+                    }
+        except Exception:
+            continue
+    return None
+
+
+def _find_i2c_devices(schematic_parser: SchematicParser, netlist_parser: NetlistParser) -> list[dict]:
+    """Find and return I2C device configurations."""
+    i2c_devices = []
+    components = list(schematic_parser.get_components())
+
+    for component in components:
+        binding = _find_i2c_binding(component.value)
+        if not binding:
+            continue
+
+        device = _check_i2c_pins(component.reference, component.value, binding, netlist_parser)
+        if device:
+            i2c_devices.append(device)
+    return i2c_devices
+
+
+def _find_spi_binding(comp_value: str) -> dict | None:
+    """Find device tree binding for SPI compatible components."""
+    for category in DEVICE_TREE_BINDINGS:
+        binding = _find_component_binding(comp_value, category)
+        if binding:
+            return binding
+    return None
+
+
+def _check_spi_pins(
+    comp_ref: str, comp_value: str, binding: dict, netlist_parser: NetlistParser
+) -> dict | None:
+    """Trace component pins to identify SPI connections."""
+    for pin_num in range(1, 9):
+        try:
+            connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
+            if connections and "net" in connections:
+                net_name = connections["net"]
+                if "SPI" in net_name.upper():
+                    return {
+                        "component": comp_ref,
+                        "value": comp_value,
+                        "compatible": binding["compatible"],
+                        "net": net_name,
+                        "pin": pin_num,
+                    }
+        except Exception:
+            continue
+    return None
+
+
+def _find_spi_devices(schematic_parser: SchematicParser, netlist_parser: NetlistParser) -> list[dict]:
+    """Find and return SPI device configurations."""
+    spi_devices = []
+    components = list(schematic_parser.get_components())
+
+    for component in components:
+        binding = _find_spi_binding(component.value)
+        if not binding:
+            continue
+
+        device = _check_spi_pins(component.reference, component.value, binding, netlist_parser)
+        if device:
+            spi_devices.append(device)
+    return spi_devices
 
 
 @mcp.tool()
@@ -416,102 +685,13 @@ Please specify a supported SOC family."""
         components = list(schematic_parser.get_components())
 
         for component in components:
-            comp_ref = component.reference
-            comp_value = component.value
-            # Find device tree binding
-            for category, _bindings in DEVICE_TREE_BINDINGS.items():
-                binding = _find_component_binding(comp_value, category)
-                if binding:
-                    # Get net connections
-                    connections = []
-                    for pin_num in range(1, 9):  # Check first 8 pins
-                        try:
-                            pin_connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
-                            if pin_connections and pin_connections[0].get("net"):
-                                net_name = pin_connections[0]["net"]
-                                peripheral_type = _infer_peripheral_type(net_name)
-
-                                connections.append({
-                                    "net": net_name,
-                                    "peripheral": peripheral_type,
-                                    "pin": pin_num,
-                                })
-                        except Exception:
-                            continue
-
-                    if connections:
-                        # Determine peripheral type based on connections
-                        i2c_nets = [c for c in connections if c["peripheral"] == "I2C"]
-                        spi_nets = [c for c in connections if c["peripheral"] == "SPI"]
-                        uart_nets = [c for c in connections if c["peripheral"] == "UART"]
-
-                        if i2c_nets:
-                            # I2C device
-                            i2c_address = _extract_i2c_address_from_net(i2c_nets[0]["net"])
-
-                            device = {
-                                "name": comp_ref,
-                                "compatible": binding["compatible"],
-                                "address": i2c_address or 0x00,
-                                "properties": {},
-                            }
-
-                            # Add to I2C bus
-                            dt_data["i2c_buses"].append({
-                                "number": 1,  # Default to I2C1
-                                "address": "0x40005400",  # Example STM32 I2C1 address
-                                "devices": [device],
-                            })
-
-                        elif spi_nets:
-                            # SPI device
-                            device = {
-                                "name": comp_ref,
-                                "compatible": binding["compatible"],
-                                "cs": 0,  # Default CS
-                                "frequency": 1000000,  # 1 MHz default
-                                "properties": {},
-                            }
-
-                            # Add to SPI bus
-                            dt_data["spi_buses"].append({
-                                "number": 1,  # Default to SPI1
-                                "address": "0x40013000",  # Example STM32 SPI1 address
-                                "devices": [device],
-                            })
-
-                        elif uart_nets:
-                            # UART device
-                            dt_data["uarts"].append({
-                                "number": 1,  # Default to USART1
-                                "address": "0x40011000",  # Example STM32 USART1 address
-                            })
+            _process_component_peripheral(component, netlist_parser, dt_data)
 
         # Extract GPIO pins
-        for component in components:
-            comp_ref = component.reference
-            comp_value = component.value
-
-            # Check if this is an MCU
-            if any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF"]):
-                # Extract GPIO pins from netlist
-                for pin_num in range(1, 100):  # Check first 100 pins
-                    try:
-                        pin_connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
-                        if pin_connections and pin_connections[0].get("net"):
-                            net_name = pin_connections[0]["net"]
-
-                            # Check if this is a GPIO net
-                            if "GPIO" in net_name.upper() or "IO" in net_name.upper():
-                                dt_data["gpio_pins"].append({
-                                    "number": pin_num,
-                                    "name": f"P{pin_num}",
-                                })
-                    except Exception:
-                        continue
+        _extract_mcu_gpios(components, netlist_parser, dt_data)
 
         # Generate device tree from template
-        template = Template(DEVICE_TREE_TEMPLATES[target_soc])
+        template = Template(DEVICE_TREE_TEMPLATES[target_soc], autoescape=True)
         device_tree = template.render(**dt_data)
 
         # Save to file if output path specified
@@ -519,8 +699,11 @@ Please specify a supported SOC family."""
             output = Path(output_path)
             output.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(output, "w") as f:
-                f.write(device_tree)
+            def _write_file(path: Path, content: str) -> None:
+                with open(path, "w") as f:
+                    f.write(content)
+
+            await asyncio.to_thread(_write_file, output, device_tree)
 
             return f"""OK **Device Tree Generated Successfully**
 
@@ -587,6 +770,45 @@ The device tree source file has been generated and saved to the specified locati
 ```"""
 
 
+def _format_gpio_configs_report(
+    gpio_configs: list[dict], schematic_path: str, soc_family: str
+) -> str:
+    """Format the GPIO configurations into a markdown report with code generation suggestions."""
+    # Format results
+    result = f"""# GPIO Configuration Extraction
+
+**Schematic:** {schematic_path}
+{'**SOC Family:** ' + soc_family if soc_family else ''}
+**Total GPIO Pins:** {len(gpio_configs)}
+
+## GPIO Pin Details
+
+| Component | Pin | Net | SOC |
+|-----------|-----|-----|-----|
+"""
+
+    for config in gpio_configs:
+        result += f"| {config['component']} | {config['pin_name']} ({config['pin_number']}) | {config['net']} | {config['soc']} |\n"
+
+    # Add code generation suggestions
+    result += "\n## Code Generation Suggestions\n\n"
+
+    # Group by SOC
+    soc_groups = {}
+    for config in gpio_configs:
+        soc = config["soc"]
+        if soc not in soc_groups:
+            soc_groups[soc] = []
+        soc_groups[soc].append(config)
+
+    for soc, configs in soc_groups.items():
+        result += f"### {soc}\n\n```c\n"
+        result += _generate_gpio_c_code(configs, soc)
+        result += "```\n\n"
+
+    return result
+
+
 @mcp.tool()
 async def extract_gpio_config(
     schematic_path: str,
@@ -620,40 +842,7 @@ async def extract_gpio_config(
         netlist_parser = NetlistParser(str(netlist_path))
 
         # Extract GPIO configurations
-        gpio_configs = []
-
-        components = netlist_parser.get_all_components()
-
-        for component in components:
-            comp_ref = component.get("ref", "")
-            comp_value = component.get("value", "")
-
-            # Filter by SOC family if specified
-            if soc_family and soc_family.lower() not in comp_value.lower():
-                continue
-
-            # Check if this is an MCU
-            if any(soc in comp_value.upper() for soc in ["STM32", "ESP32", "NRF", "ATMEGA"]):
-                for pin in component.get("pins", []):
-                    pin_num = pin.get("number", "")
-                    pin_name = pin.get("name", "")
-
-                    try:
-                        connections = netlist_parser.trace_connection(comp_ref, pin_num)
-                        if connections and connections[0].get("net"):
-                            net_name = connections[0]["net"]
-
-                            # Check if this is a GPIO net
-                            if "GPIO" in net_name.upper() or "IO" in net_name.upper():
-                                gpio_configs.append({
-                                    "component": comp_ref,
-                                    "pin_number": pin_num,
-                                    "pin_name": pin_name,
-                                    "net": net_name,
-                                    "soc": comp_value,
-                                })
-                    except Exception:
-                        continue
+        gpio_configs = _find_gpio_configs(netlist_parser, soc_family)
 
         if not gpio_configs:
             return f"""WARN **No GPIO Configurations Found**
@@ -668,53 +857,7 @@ No GPIO configurations were found in the schematic.
 2. Check net names contain 'GPIO' or 'IO'
 3. Try without SOC family filter"""
 
-        # Format results
-        result = f"""# GPIO Configuration Extraction
-
-**Schematic:** {schematic_path}
-{'**SOC Family:** ' + soc_family if soc_family else ''}
-**Total GPIO Pins:** {len(gpio_configs)}
-
-## GPIO Pin Details
-
-| Component | Pin | Net | SOC |
-|-----------|-----|-----|-----|
-"""
-
-        for config in gpio_configs:
-            result += f"| {config['component']} | {config['pin_name']} ({config['pin_number']}) | {config['net']} | {config['soc']} |\n"
-
-        # Add code generation suggestions
-        result += "\n## Code Generation Suggestions\n\n"
-
-        # Group by SOC
-        soc_groups = {}
-        for config in gpio_configs:
-            soc = config["soc"]
-            if soc not in soc_groups:
-                soc_groups[soc] = []
-            soc_groups[soc].append(config)
-
-        for soc, configs in soc_groups.items():
-            result += f"### {soc}\n\n```c\n"
-            result += f"// GPIO configuration for {soc}\n\n"
-
-            for config in configs[:10]:  # Show first 10
-                result += f"// {config['pin_name']} ({config['pin_number']}): {config['net']}\n"
-                if "STM32" in soc.upper():
-                    result += f"GPIO_InitTypeDef gpio_{config['pin_name'].lower()};\n"
-                    result += f"gpio_{config['pin_name'].lower()}.Pin = GPIO_PIN_{config['pin_number']};\n"
-                    result += f"gpio_{config['pin_name'].lower()}.Mode = GPIO_MODE_OUTPUT_PP;\n"
-                    result += f"HAL_GPIO_Init(GPIO{config['pin_name'][1]}, &gpio_{config['pin_name'].lower()});\n\n"
-                elif "ESP32" in soc.upper():
-                    result += f"gpio_set_direction(GPIO{config['pin_number']}, GPIO_MODE_OUTPUT);\n\n"
-
-            if len(configs) > 10:
-                result += f"// ... and {len(configs) - 10} more GPIO pins\n"
-
-            result += "```\n\n"
-
-        return result
+        return _format_gpio_configs_report(gpio_configs, schematic_path, soc_family)
 
     except Exception as e:
         import traceback
@@ -764,38 +907,7 @@ async def extract_i2c_devices(
         schematic_parser = SchematicParser(str(sch_path))
 
         # Extract I2C devices
-        i2c_devices = []
-
-        components = list(schematic_parser.get_components())
-
-        for component in components:
-            comp_ref = component.reference
-            comp_value = component.value
-            # Check if this is an I2C device
-            for category, _bindings in DEVICE_TREE_BINDINGS.items():
-                binding = _find_component_binding(comp_value, category)
-                if binding:
-                    # Get net connections
-                    for pin_num in range(1, 9):
-                        try:
-                            connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
-                            if connections and connections[0].get("net"):
-                                net_name = connections[0]["net"]
-
-                                if "I2C" in net_name.upper() or "TWI" in net_name.upper():
-                                    i2c_address = _extract_i2c_address_from_net(net_name)
-
-                                    i2c_devices.append({
-                                        "component": comp_ref,
-                                        "value": comp_value,
-                                        "compatible": binding["compatible"],
-                                        "address": i2c_address,
-                                        "net": net_name,
-                                        "pin": pin_num,
-                                    })
-                                    break
-                        except Exception:
-                            continue
+        i2c_devices = _find_i2c_devices(schematic_parser, netlist_parser)
 
         if not i2c_devices:
             return f"""WARN **No I2C Devices Found**
@@ -826,7 +938,7 @@ No I2C devices were found in the schematic.
             result += f"| {device['component']} | {device['value']} | {device['compatible']} | {address_str} | {device['net']} |\n"
 
         # Add device tree generation
-        result += "\n## Device Tree Configuration\n\n```dts\n"
+        result += DTS_CONFIG_HEADER
         result += "&i2c1 {\n"
         result += "    status = \"okay\";\n\n"
 
@@ -837,7 +949,7 @@ No I2C devices were found in the schematic.
             result += f"        reg = <{address_str}>;\n"
             result += "    };\n\n"
 
-        result += "};\n```"
+        result += DTS_CONFIG_FOOTER
 
         return result
 
@@ -888,36 +1000,7 @@ async def extract_spi_devices(
         schematic_parser = SchematicParser(str(sch_path))
 
         # Extract SPI devices
-        spi_devices = []
-
-        components = list(schematic_parser.get_components())
-
-        for component in components:
-            comp_ref = component.reference
-            comp_value = component.value
-
-            # Check if this is an SPI device
-            for category, _bindings in DEVICE_TREE_BINDINGS.items():
-                binding = _find_component_binding(comp_value, category)
-                if binding:
-                    # Get net connections
-                    for pin_num in range(1, 9):
-                        try:
-                            connections = netlist_parser.trace_connection(comp_ref, str(pin_num))
-                            if connections and connections[0].get("net"):
-                                net_name = connections[0]["net"]
-
-                                if "SPI" in net_name.upper():
-                                    spi_devices.append({
-                                        "component": comp_ref,
-                                        "value": comp_value,
-                                        "compatible": binding["compatible"],
-                                        "net": net_name,
-                                        "pin": pin_num,
-                                    })
-                                    break
-                        except Exception:
-                            continue
+        spi_devices = _find_spi_devices(schematic_parser, netlist_parser)
 
         if not spi_devices:
             return f"""WARN **No SPI Devices Found**
@@ -940,14 +1023,14 @@ No SPI devices were found in the schematic.
 ## SPI Device Details
 
 | Component | Device | Compatible | Net |
-|-----------|--------|------------|-----|
+|-----------|--------|------------|---------|
 """
 
         for device in spi_devices:
             result += f"| {device['component']} | {device['value']} | {device['compatible']} | {device['net']} |\n"
 
         # Add device tree generation
-        result += "\n## Device Tree Configuration\n\n```dts\n"
+        result += DTS_CONFIG_HEADER
         result += "&spi1 {\n"
         result += "    status = \"okay\";\n\n"
 
@@ -958,7 +1041,7 @@ No SPI devices were found in the schematic.
             result += "        spi-max-frequency = <1000000>;\n"
             result += "    };\n\n"
 
-        result += "};\n```"
+        result += DTS_CONFIG_FOOTER
 
         return result
 
@@ -1052,7 +1135,7 @@ No power management components were found in the schematic.
             result += f"| {comp['reference']} | {comp['value']} | {comp_type} |\n"
 
         # Add device tree generation suggestions
-        result += "\n## Device Tree Configuration\n\n```dts\n"
+        result += DTS_CONFIG_HEADER
         result += "/ {\n"
         result += "    regulators {\n\n"
 
@@ -1068,7 +1151,7 @@ No power management components were found in the schematic.
             result += "        // ... and " + str(len(power_components) - 5) + " more regulators\n"
 
         result += "    };\n"
-        result += "};\n```"
+        result += DTS_CONFIG_FOOTER
 
         return result
 

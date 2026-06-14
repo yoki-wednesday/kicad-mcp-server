@@ -1,6 +1,7 @@
 """KiCad netlist parser for accurate component network tracking."""
 
 import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as DET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,86 @@ class NetlistParser:
 
         self._data: dict[str, Any] | None = None
 
+    def _parse_components(self, root: ET.Element) -> dict[str, NetlistComponent]:
+        """Extract components from the root XML element.
+
+        Args:
+            root: XML root element
+
+        Returns:
+            Dictionary mapping reference to component
+        """
+        components = {}
+        for comp in root.findall(".//comp"):
+            ref = comp.get("ref")
+            if not ref:
+                continue
+            value = comp.findtext("value", "")
+            library = comp.findtext("libsource/libpart", "")
+            footprint = comp.findtext("footprint/libpart", "")
+
+            components[ref] = NetlistComponent(
+                reference=ref,
+                value=value,
+                library=library,
+                footprint=footprint,
+                pins={},
+            )
+        return components
+
+    def _parse_single_net(
+        self, net: ET.Element, components: dict[str, NetlistComponent]
+    ) -> tuple[str, NetlistNet] | None:
+        """Parse a single net XML element and populate component pins.
+
+        Args:
+            net: XML net element
+            components: Dictionary of existing components to populate pins for
+
+        Returns:
+            Tuple of (net_name, NetlistNet) or None if validation fails
+        """
+        code_str = net.get("code")
+        name = net.get("name")
+        if not code_str or not name:
+            return None
+        try:
+            code = int(code_str)
+        except ValueError:
+            return None
+
+        pins_list = []
+        for node in net.findall("node"):
+            ref = node.get("ref")
+            pin_num = node.get("pin")
+            if ref and pin_num:
+                pins_list.append((ref, pin_num))
+
+                if ref in components:
+                    components[ref].pins[pin_num] = name
+
+        return name, NetlistNet(name=name, code=code, pins=pins_list)
+
+    def _parse_nets(
+        self, root: ET.Element, components: dict[str, NetlistComponent]
+    ) -> dict[str, NetlistNet]:
+        """Extract nets from the root XML element and populate component pins.
+
+        Args:
+            root: XML root element
+            components: Dictionary of existing components to populate pins for
+
+        Returns:
+            Dictionary mapping net name to net
+        """
+        nets = {}
+        for net in root.findall(".//net"):
+            result = self._parse_single_net(net, components)
+            if result is not None:
+                name, net_obj = result
+                nets[name] = net_obj
+        return nets
+
     def _parse_file(self) -> dict[str, Any]:
         """Parse the netlist XML file.
 
@@ -57,44 +138,11 @@ class NetlistParser:
         if self._data is not None:
             return self._data
 
-        tree = ET.parse(self.file_path)
+        tree = DET.parse(self.file_path)
         root = tree.getroot()
 
-        # Parse components (KiCad 9.0+ uses <comp> not <component>)
-        components = {}
-        for comp in root.findall(".//comp"):
-            ref = comp.get("ref")
-            value = comp.findtext("value", "")
-            library = comp.findtext("libsource/libpart", "")
-            footprint = comp.findtext("footprint/libpart", "")
-
-            # Pins will be populated from nets later
-            components[ref] = NetlistComponent(
-                reference=ref,
-                value=value,
-                library=library,
-                footprint=footprint,
-                pins={},  # Empty initially, will populate from nets
-            )
-
-        # Parse nets and populate component pins
-        nets = {}
-        for net in root.findall(".//net"):
-            code = int(net.get("code"))
-            name = net.get("name")
-
-            pins_list = []
-            for node in net.findall("node"):
-                ref = node.get("ref")
-                pin_num = node.get("pin")
-                if ref and pin_num:
-                    pins_list.append((ref, pin_num))
-
-                    # Populate component pins
-                    if ref in components:
-                        components[ref].pins[pin_num] = name
-
-            nets[name] = NetlistNet(name=name, code=code, pins=pins_list)
+        components = self._parse_components(root)
+        nets = self._parse_nets(root, components)
 
         self._data = {
             "components": components,

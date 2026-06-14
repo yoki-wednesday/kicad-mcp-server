@@ -3,11 +3,26 @@
 import json
 import subprocess
 import tempfile
-import xml.etree.ElementTree as ET
+import defusedxml.ElementTree as ET
 from pathlib import Path
 
 from ..models.types import DRCError, ERCError
 from ..server import mcp
+
+# Constants to avoid duplicated string literals (python:S1192)
+SEVERITY_ERROR = "error"
+SEVERITY_WARNING = "warning"
+TYPE_UNKNOWN = "unknown"
+TYPE_PARSE_ERROR = "parse_error"
+FIELD_SEVERITY = "severity"
+FIELD_TYPE = "type"
+FIELD_DESCRIPTION = "description"
+FIELD_SHEETS = "sheets"
+FIELD_VIOLATIONS = "violations"
+FIELD_ITEMS = "items"
+
+SUFFIX_ERC_REPORT = "_erc.rpt"
+SUFFIX_DRC_REPORT = "_drc.rpt"
 
 
 def _temp_dir() -> Path:
@@ -30,6 +45,57 @@ def _find_root_schematic(sch_path: Path) -> Path | None:
     return None
 
 
+def _parse_erc_json(content: str) -> list[ERCError]:
+    """Parse ERC report from JSON format (KiCad 9.0+)."""
+    errors = []
+    data = json.loads(content)
+    for sheet in data.get(FIELD_SHEETS, []):
+        for v in sheet.get(FIELD_VIOLATIONS, []):
+            components = []
+            for item in v.get(FIELD_ITEMS, []):
+                desc = item.get(FIELD_DESCRIPTION, "")
+                if "Symbol" in desc:
+                    parts = desc.split()
+                    if len(parts) >= 2:
+                        components.append(parts[1])
+
+            errors.append(
+                ERCError(
+                    severity=v.get(FIELD_SEVERITY, SEVERITY_ERROR),
+                    type=v.get(FIELD_TYPE, TYPE_UNKNOWN),
+                    description=v.get(FIELD_DESCRIPTION, ""),
+                    components=components,
+                )
+            )
+    return errors
+
+
+def _parse_erc_xml(content: str) -> list[ERCError]:
+    """Parse ERC report from XML format."""
+    errors = []
+    root = ET.fromstring(content)
+    for violation in root.findall(".//violation"):
+        severity = violation.get(FIELD_SEVERITY, SEVERITY_ERROR)
+        error_type = violation.get(FIELD_TYPE, TYPE_UNKNOWN)
+        description = violation.get(FIELD_DESCRIPTION, "")
+
+        components = []
+        for comp in violation.findall(".//component"):
+            ref = comp.get("ref", "")
+            if ref:
+                components.append(ref)
+
+        errors.append(
+            ERCError(
+                severity=severity,
+                type=error_type,
+                description=description,
+                components=components,
+            )
+        )
+    return errors
+
+
 def _parse_erc_report(report_path: Path) -> list[ERCError]:
     """Parse ERC report file (JSON or XML format).
 
@@ -39,67 +105,71 @@ def _parse_erc_report(report_path: Path) -> list[ERCError]:
     Returns:
         List of ERC errors/warnings
     """
-    errors = []
     content = report_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        data = json.loads(content)
-        # JSON format (KiCad 9.0+)
-        for sheet in data.get("sheets", []):
-            for v in sheet.get("violations", []):
-                components = []
-                for item in v.get("items", []):
-                    desc = item.get("description", "")
-                    # Extract reference from description like "Symbol U1 pin 1 [...]"
-                    if "Symbol" in desc:
-                        parts = desc.split()
-                        if len(parts) >= 2:
-                            components.append(parts[1])
-
-                errors.append(
-                    ERCError(
-                        severity=v.get("severity", "error"),
-                        type=v.get("type", "unknown"),
-                        description=v.get("description", ""),
-                        components=components,
-                    )
-                )
-        return errors
+        return _parse_erc_json(content)
     except (json.JSONDecodeError, KeyError):
         pass
 
-    # Fallback: XML format
     try:
-        root = ET.fromstring(content)
-        for violation in root.findall(".//violation"):
-            severity = violation.get("severity", "error")
-            error_type = violation.get("type", "unknown")
-            description = violation.get("description", "")
-
-            components = []
-            for comp in violation.findall(".//component"):
-                ref = comp.get("ref", "")
-                if ref:
-                    components.append(ref)
-
-            errors.append(
-                ERCError(
-                    severity=severity,
-                    type=error_type,
-                    description=description,
-                    components=components,
-                )
-            )
+        return _parse_erc_xml(content)
     except ET.ParseError as e:
-        errors.append(
+        return [
             ERCError(
-                severity="error",
-                type="parse_error",
+                severity=SEVERITY_ERROR,
+                type=TYPE_PARSE_ERROR,
                 description=f"Failed to parse ERC report: {str(e)}",
                 components=[],
             )
-        )
+        ]
 
+
+def _parse_drc_json(content: str) -> list[DRCError]:
+    """Parse DRC report from JSON format (KiCad 9.0+)."""
+    errors = []
+    data = json.loads(content)
+    for sheet in data.get(FIELD_SHEETS, []):
+        for v in sheet.get(FIELD_VIOLATIONS, []):
+            x, y = 0.0, 0.0
+            items = v.get(FIELD_ITEMS, [])
+            if items:
+                pos = items[0].get("pos", {})
+                x = float(pos.get("x", 0))
+                y = float(pos.get("y", 0))
+
+            errors.append(
+                DRCError(
+                    severity=v.get(FIELD_SEVERITY, SEVERITY_ERROR),
+                    type=v.get(FIELD_TYPE, TYPE_UNKNOWN),
+                    description=v.get(FIELD_DESCRIPTION, ""),
+                    location=(x, y),
+                )
+            )
+    return errors
+
+
+def _parse_drc_xml(content: str) -> list[DRCError]:
+    """Parse DRC report from XML format."""
+    errors = []
+    root = ET.fromstring(content)
+    for violation in root.findall(".//violation"):
+        severity = violation.get(FIELD_SEVERITY, SEVERITY_ERROR)
+        error_type = violation.get(FIELD_TYPE, TYPE_UNKNOWN)
+        description = violation.get(FIELD_DESCRIPTION, "")
+
+        location_elem = violation.find(".//location")
+        x = float(location_elem.get("x", "0")) if location_elem is not None else 0.0
+        y = float(location_elem.get("y", "0")) if location_elem is not None else 0.0
+
+        errors.append(
+            DRCError(
+                severity=severity,
+                type=error_type,
+                description=description,
+                location=(x, y),
+            )
+        )
     return errors
 
 
@@ -112,64 +182,25 @@ def _parse_drc_report(report_path: Path) -> list[DRCError]:
     Returns:
         List of DRC errors/warnings
     """
-    errors = []
     content = report_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        data = json.loads(content)
-        # JSON format (KiCad 9.0+)
-        for sheet in data.get("sheets", []):
-            for v in sheet.get("violations", []):
-                x, y = 0.0, 0.0
-                items = v.get("items", [])
-                if items:
-                    pos = items[0].get("pos", {})
-                    x = float(pos.get("x", 0))
-                    y = float(pos.get("y", 0))
-
-                errors.append(
-                    DRCError(
-                        severity=v.get("severity", "error"),
-                        type=v.get("type", "unknown"),
-                        description=v.get("description", ""),
-                        location=(x, y),
-                    )
-                )
-        return errors
+        return _parse_drc_json(content)
     except (json.JSONDecodeError, KeyError):
         pass
 
-    # Fallback: XML format
     try:
-        root = ET.fromstring(content)
-        for violation in root.findall(".//violation"):
-            severity = violation.get("severity", "error")
-            error_type = violation.get("type", "unknown")
-            description = violation.get("description", "")
-
-            location_elem = violation.find(".//location")
-            x = float(location_elem.get("x", "0")) if location_elem is not None else 0.0
-            y = float(location_elem.get("y", "0")) if location_elem is not None else 0.0
-
-            errors.append(
-                DRCError(
-                    severity=severity,
-                    type=error_type,
-                    description=description,
-                    location=(x, y),
-                )
-            )
+        return _parse_drc_xml(content)
     except ET.ParseError as e:
-        errors.append(
+        return [
             DRCError(
-                severity="error",
-                type="parse_error",
+                severity=SEVERITY_ERROR,
+                type=TYPE_PARSE_ERROR,
                 description=f"Failed to parse DRC report: {str(e)}",
                 location=(0.0, 0.0),
             )
-        )
+        ]
 
-    return errors
 
 
 def _filter_erc_errors(errors: list[ERCError], severity: str = "") -> list[ERCError]:
@@ -202,6 +233,92 @@ def _filter_drc_errors(errors: list[DRCError], violation_type: str = "") -> list
         return errors
 
     return [e for e in errors if e.type == violation_type]
+
+
+def _format_erc_report_results(
+    schematic_path: str,
+    erc_report_path: Path,
+    subsheet_note: str,
+) -> str:
+    """Format the ERC report file results into a markdown string."""
+    if not erc_report_path.exists():
+        # No violations found - check if report was generated
+        # KiCad 9.0+ might use different format
+        return f"""✅ **ERC Check Passed**
+
+**Schematic:** {schematic_path}
+
+No electrical violations detected!{subsheet_note}
+
+**Checked:**
+- ✅ All pins properly connected
+- ✅ No power conflicts
+- ✅ No multiple outputs on same net
+- ✅ No pin type mismatches"""
+
+    # Parse and format results
+    try:
+        errors = _parse_erc_report(erc_report_path)
+
+        if not errors:
+            return f"""✅ **ERC Check Passed**
+
+**Schematic:** {schematic_path}
+
+No electrical violations detected!{subsheet_note}"""
+
+        # Count by severity
+        error_count = sum(1 for e in errors if e.severity == SEVERITY_ERROR)
+        warning_count = sum(1 for e in errors if e.severity == SEVERITY_WARNING)
+
+        # Format violations
+        violations_table = "| Severity | Type | Description | Components |\n"
+        violations_table += "|----------|------|-------------|------------|\n"
+
+        for error in errors[:20]:  # Limit to first 20
+            severity_icon = "❌" if error.severity == SEVERITY_ERROR else "⚠️"
+            components_str = ", ".join(error.components) if error.components else "N/A"
+            violations_table += f"| {severity_icon} {error.severity} | {error.type} | {error.description[:50]} | {components_str} |\n"
+
+        if len(errors) > 20:
+            violations_table += f"\n*... and {len(errors) - 20} more violations*\n"
+
+        return f"""❌ **ERC Violations Detected**
+
+**Schematic:** {schematic_path}
+**Total Violations:** {len(errors)}
+- Errors: {error_count}
+- Warnings: {warning_count}{subsheet_note}
+
+## Violations
+
+{violations_table}
+
+## Recommendations
+
+1. **Fix all errors** before proceeding to PCB layout
+2. Review warnings - some may be acceptable
+3. Re-run ERC after fixes
+4. Use `get_erc_violations()` for detailed filtering
+
+## Next Steps
+
+- Run `get_erc_violations()` with filters to analyze specific issues
+- Fix violations in KiCad Eeschema
+- Re-run `run_erc()` to verify fixes"""
+
+    except Exception as e:
+        return f"""⚠️ **ERC Report Parse Error**
+
+**Schematic:** {schematic_path}
+
+ERC check completed but failed to parse report.
+
+**Error:** {str(e)}
+
+**Report location:** {erc_report_path}
+
+You can manually inspect the report file or re-run ERC in KiCad GUI.{subsheet_note}"""
 
 
 @mcp.tool()
@@ -238,7 +355,7 @@ async def run_erc(
             sch_path = root_sch
 
         # ERC report output path
-        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + SUFFIX_ERC_REPORT)
 
         # Run ERC using kicad-cli (KiCad 7+)
         cmd = [
@@ -252,15 +369,25 @@ async def run_erc(
             str(sch_path),
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=60,
+        import asyncio
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return f"❌ **ERC Check Failed**\n\n**Schematic:** {schematic_path}\n\n**Error:**\n```\nCommand timed out after 60 seconds.\n```"
 
-        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
 
-        if result.returncode != 0:
+        if proc.returncode != 0:
             return f"""❌ **ERC Check Failed**
 
 **Schematic:** {schematic_path}
@@ -280,85 +407,7 @@ async def run_erc(
 2. Run: Inspect → Electrical Rules Checker
 3. Export report manually{subsheet_note}"""
 
-        # Parse ERC report
-        if not erc_report_path.exists():
-            # No violations found - check if report was generated
-            # KiCad 9.0+ might use different format
-            return f"""✅ **ERC Check Passed**
-
-**Schematic:** {schematic_path}
-
-No electrical violations detected!{subsheet_note}
-
-**Checked:**
-- ✅ All pins properly connected
-- ✅ No power conflicts
-- ✅ No multiple outputs on same net
-- ✅ No pin type mismatches"""
-
-        # Parse and format results
-        try:
-            errors = _parse_erc_report(erc_report_path)
-
-            if not errors:
-                return f"""✅ **ERC Check Passed**
-
-**Schematic:** {schematic_path}
-
-No electrical violations detected!{subsheet_note}"""
-
-            # Count by severity
-            error_count = sum(1 for e in errors if e.severity == "error")
-            warning_count = sum(1 for e in errors if e.severity == "warning")
-
-            # Format violations
-            violations_table = "| Severity | Type | Description | Components |\n"
-            violations_table += "|----------|------|-------------|------------|\n"
-
-            for error in errors[:20]:  # Limit to first 20
-                severity_icon = "❌" if error.severity == "error" else "⚠️"
-                components_str = ", ".join(error.components) if error.components else "N/A"
-                violations_table += f"| {severity_icon} {error.severity} | {error.type} | {error.description[:50]} | {components_str} |\n"
-
-            if len(errors) > 20:
-                violations_table += f"\n*... and {len(errors) - 20} more violations*\n"
-
-            return f"""❌ **ERC Violations Detected**
-
-**Schematic:** {schematic_path}
-**Total Violations:** {len(errors)}
-- Errors: {error_count}
-- Warnings: {warning_count}{subsheet_note}
-
-## Violations
-
-{violations_table}
-
-## Recommendations
-
-1. **Fix all errors** before proceeding to PCB layout
-2. Review warnings - some may be acceptable
-3. Re-run ERC after fixes
-4. Use `get_erc_violations()` for detailed filtering
-
-## Next Steps
-
-- Run `get_erc_violations()` with filters to analyze specific issues
-- Fix violations in KiCad Eeschema
-- Re-run `run_erc()` to verify fixes"""
-
-        except Exception as e:
-            return f"""⚠️ **ERC Report Parse Error**
-
-**Schematic:** {schematic_path}
-
-ERC check completed but failed to parse report.
-
-**Error:** {str(e)}
-
-**Report location:** {erc_report_path}
-
-You can manually inspect the report file or re-run ERC in KiCad GUI.{subsheet_note}"""
+        return _format_erc_report_results(schematic_path, erc_report_path, subsheet_note)
 
     except FileNotFoundError:
         return f"""❌ **File Not Found**
@@ -379,6 +428,103 @@ Please check the file path and try again."""
 ```
 {traceback.format_exc()}
 ```"""
+
+
+def _format_drc_report_results(
+    pcb_path: str,
+    drc_report_path: Path,
+) -> str:
+    """Format the DRC report file results into a markdown string."""
+    if not drc_report_path.exists():
+        # No violations found
+        return f"""✅ **DRC Check Passed**
+
+**PCB:** {pcb_path}
+
+No design rule violations detected!
+
+**Checked:**
+- ✅ All clearance requirements met
+- ✅ No spacing violations
+- ✅ All connections routed
+- ✅ No pad/footprint overlaps
+- ✅ Board edge constraints satisfied"""
+
+    # Parse and format results
+    try:
+        errors = _parse_drc_report(drc_report_path)
+
+        if not errors:
+            return f"""✅ **DRC Check Passed**
+
+**PCB:** {pcb_path}
+
+No design rule violations detected!"""
+
+        # Count by severity
+        error_count = sum(1 for e in errors if e.severity == SEVERITY_ERROR)
+        warning_count = sum(1 for e in errors if e.severity == SEVERITY_WARNING)
+
+        # Group by type
+        type_counts = {}
+        for error in errors:
+            type_counts[error.type] = type_counts.get(error.type, 0) + 1
+
+        # Format violations
+        violations_table = "| Severity | Type | Location | Description |\n"
+        violations_table += "|----------|------|----------|-------------|\n"
+
+        for error in errors[:20]:  # Limit to first 20
+            severity_icon = "❌" if error.severity == SEVERITY_ERROR else "⚠️"
+            x, y = error.location
+            violations_table += f"| {severity_icon} {error.severity} | {error.type} | ({x:.2f}, {y:.2f}) | {error.description[:40]} |\n"
+
+        if len(errors) > 20:
+            violations_table += f"\n*... and {len(errors) - 20} more violations*\n"
+
+        # Format type summary
+        type_summary = "\n## Violation Summary\n\n"
+        for vtype, count in sorted(type_counts.items()):
+            type_summary += f"- **{vtype}**: {count} violations\n"
+
+        return f"""❌ **DRC Violations Detected**
+
+**PCB:** {pcb_path}
+**Total Violations:** {len(errors)}
+- Errors: {error_count}
+- Warnings: {warning_count}
+
+{type_summary}
+## Violations
+
+{violations_table}
+
+## Recommendations
+
+1. **Fix all errors** before manufacturing
+2. Review warnings - some may be acceptable
+3. Pay attention to clearance violations
+4. Re-run DRC after fixes
+5. Use `get_drc_violations()` for detailed filtering
+
+## Next Steps
+
+- Run `get_drc_violations()` with filters to analyze specific issues
+- Fix violations in KiCad Pcbnew
+- Re-run `run_drc()` to verify fixes"""
+
+    except Exception as e:
+        return f"""⚠️ **DRC Report Parse Error**
+
+**PCB:** {pcb_path}
+
+DRC check completed but failed to parse report.
+
+**Error:** {str(e)}
+
+**Report location:** {drc_report_path}
+
+You can manually inspect the report file or re-run DRC in KiCad GUI."""
 
 
 @mcp.tool()
@@ -406,7 +552,7 @@ async def run_drc(
             return f"❌ **PCB file not found:** {pcb_path}"
 
         # DRC report output path
-        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + SUFFIX_DRC_REPORT)
 
         # Run DRC using kicad-cli (KiCad 7+)
         cmd = [
@@ -420,15 +566,25 @@ async def run_drc(
             str(pcb),
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=60,
+        import asyncio
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return f"❌ **DRC Check Failed**\n\n**PCB:** {pcb_path}\n\n**Error:**\n```\nCommand timed out after 60 seconds.\n```"
 
-        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+        stderr_text = stderr.decode("utf-8", errors="replace") if stderr else ""
 
-        if result.returncode != 0:
+        if proc.returncode != 0:
             return f"""❌ **DRC Check Failed**
 
 **PCB:** {pcb_path}
@@ -448,97 +604,7 @@ async def run_drc(
 2. Run: Inspect → Design Rules Checker
 3. Export report manually"""
 
-        # Parse DRC report
-        if not drc_report_path.exists():
-            # No violations found
-            return f"""✅ **DRC Check Passed**
-
-**PCB:** {pcb_path}
-
-No design rule violations detected!
-
-**Checked:**
-- ✅ All clearance requirements met
-- ✅ No spacing violations
-- ✅ All connections routed
-- ✅ No pad/footprint overlaps
-- ✅ Board edge constraints satisfied"""
-
-        # Parse and format results
-        try:
-            errors = _parse_drc_report(drc_report_path)
-
-            if not errors:
-                return f"""✅ **DRC Check Passed**
-
-**PCB:** {pcb_path}
-
-No design rule violations detected!"""
-
-            # Count by severity
-            error_count = sum(1 for e in errors if e.severity == "error")
-            warning_count = sum(1 for e in errors if e.severity == "warning")
-
-            # Group by type
-            type_counts = {}
-            for error in errors:
-                type_counts[error.type] = type_counts.get(error.type, 0) + 1
-
-            # Format violations
-            violations_table = "| Severity | Type | Location | Description |\n"
-            violations_table += "|----------|------|----------|-------------|\n"
-
-            for error in errors[:20]:  # Limit to first 20
-                severity_icon = "❌" if error.severity == "error" else "⚠️"
-                x, y = error.location
-                violations_table += f"| {severity_icon} {error.severity} | {error.type} | ({x:.2f}, {y:.2f}) | {error.description[:40]} |\n"
-
-            if len(errors) > 20:
-                violations_table += f"\n*... and {len(errors) - 20} more violations*\n"
-
-            # Format type summary
-            type_summary = "\n## Violation Summary\n\n"
-            for vtype, count in sorted(type_counts.items()):
-                type_summary += f"- **{vtype}**: {count} violations\n"
-
-            return f"""❌ **DRC Violations Detected**
-
-**PCB:** {pcb_path}
-**Total Violations:** {len(errors)}
-- Errors: {error_count}
-- Warnings: {warning_count}
-
-{type_summary}
-## Violations
-
-{violations_table}
-
-## Recommendations
-
-1. **Fix all errors** before manufacturing
-2. Review warnings - some may be acceptable
-3. Pay attention to clearance violations
-4. Re-run DRC after fixes
-5. Use `get_drc_violations()` for detailed filtering
-
-## Next Steps
-
-- Run `get_drc_violations()` with filters to analyze specific issues
-- Fix violations in KiCad Pcbnew
-- Re-run `run_drc()` to verify fixes"""
-
-        except Exception as e:
-            return f"""⚠️ **DRC Report Parse Error**
-
-**PCB:** {pcb_path}
-
-DRC check completed but failed to parse report.
-
-**Error:** {str(e)}
-
-**Report location:** {drc_report_path}
-
-You can manually inspect the report file or re-run DRC in KiCad GUI."""
+        return _format_drc_report_results(pcb_path, drc_report_path)
 
     except FileNotFoundError:
         return f"""❌ **File Not Found**
@@ -581,7 +647,7 @@ async def get_erc_violations(
             return f"❌ **Schematic file not found:** {schematic_path}"
 
         # ERC report output path
-        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + SUFFIX_ERC_REPORT)
 
         if not erc_report_path.exists():
             # Run ERC first
@@ -624,7 +690,7 @@ No violations match the specified filter."""
 """
 
         for error in filtered_errors:
-            severity_icon = "❌" if error.severity == "error" else "⚠️"
+            severity_icon = "❌" if error.severity == SEVERITY_ERROR else "⚠️"
             components_str = ", ".join(error.components) if error.components else "N/A"
             result += f"| {severity_icon} {error.severity} | {error.type} | {error.description} | {components_str} |\n"
 
@@ -665,7 +731,7 @@ async def get_drc_violations(
             return f"❌ **PCB file not found:** {pcb_path}"
 
         # DRC report output path
-        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + SUFFIX_DRC_REPORT)
 
         if not drc_report_path.exists():
             # Run DRC first
@@ -708,7 +774,7 @@ No violations match the specified filter."""
 """
 
         for error in filtered_errors:
-            severity_icon = "❌" if error.severity == "error" else "⚠️"
+            severity_icon = "❌" if error.severity == SEVERITY_ERROR else "⚠️"
             x, y = error.location
             result += f"| {severity_icon} {error.severity} | {error.type} | ({x:.2f}, {y:.2f}) | {error.description} |\n"
 
@@ -755,7 +821,7 @@ async def export_erc_report(
             return f"❌ **ERC Check Failed**\n\n{initial_result}"
 
         # ERC report path
-        erc_report_path = _temp_dir() / (sch_path.stem + "_erc.rpt")
+        erc_report_path = _temp_dir() / (sch_path.stem + SUFFIX_ERC_REPORT)
 
         if not erc_report_path.exists():
             return "❌ **ERC report not found.** Run ERC check first."
@@ -820,7 +886,7 @@ async def export_drc_report(
             return f"❌ **DRC Check Failed**\n\n{initial_result}"
 
         # DRC report path
-        drc_report_path = _temp_dir() / (pcb.stem + "_drc.rpt")
+        drc_report_path = _temp_dir() / (pcb.stem + SUFFIX_DRC_REPORT)
 
         if not drc_report_path.exists():
             return "❌ **DRC report not found.** Run DRC check first."
